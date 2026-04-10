@@ -1,0 +1,1124 @@
+/*
+Plugin Name: Custom YouTube Search Player (Chinese Learner Edition)
+Description: Tìm kiếm video có phụ đề, tối ưu cho người học tiếng Trung. V4.0: Dictation & Shadowing với YT.Player API – tự dừng + che màn hình.
+Version: 4.0
+Author: Bạn (Upgraded)
+*/
+
+// ==========================================
+// 1. CÀI ĐẶT API KEY
+// ==========================================
+add_action('admin_menu', 'cysp_add_settings_page');
+function cysp_add_settings_page() {
+    add_options_page('YouTube API Settings', 'YouTube Player', 'manage_options', 'cysp-settings', 'cysp_render_settings_page');
+}
+function cysp_render_settings_page() { ?>
+    <div class="wrap">
+        <h2>Cài đặt API Key cho Custom YouTube Player</h2>
+        <form method="post" action="options.php">
+            <?php settings_fields('cysp_settings_group'); ?>
+            <table class="form-table">
+                <tr valign="top">
+                <th scope="row">Nhập YouTube API Key:</th>
+                <td><input type="text" name="cysp_api_key" value="<?php echo esc_attr(get_option('cysp_api_key')); ?>" style="width:400px;" /></td>
+                </tr>
+            </table>
+            <?php submit_button('Lưu thay đổi'); ?>
+        </form>
+    </div><?php
+}
+add_action('admin_init', 'cysp_register_settings');
+function cysp_register_settings() {
+    register_setting('cysp_settings_group', 'cysp_api_key');
+}
+
+// ==========================================
+// 2B. AJAX LẤY TRANSCRIPT (Innertube – không cần API key)
+// ==========================================
+add_action('wp_ajax_cysp_get_transcript',        'cysp_handle_get_transcript');
+add_action('wp_ajax_nopriv_cysp_get_transcript', 'cysp_handle_get_transcript');
+
+function cysp_handle_get_transcript() {
+    check_ajax_referer('cysp_search_secure_nonce', 'security');
+
+    $video_id = isset($_POST['video_id']) ? sanitize_text_field($_POST['video_id']) : '';
+    $lang     = isset($_POST['lang'])     ? sanitize_text_field($_POST['lang'])     : 'zh-CN';
+    if (!$video_id) wp_send_json_error('Thiếu video_id.');
+
+    // Cache 6 tiếng
+    $cache_key = 'cysp_tr_' . md5($video_id . $lang);
+    $cached    = get_transient($cache_key);
+    if ($cached !== false) wp_send_json_success($cached);
+
+    // ── Bước 1: Lấy trang YouTube để lấy INNERTUBE_API_KEY ──
+    $page = wp_remote_get('https://www.youtube.com/watch?v=' . urlencode($video_id), [
+        'headers' => [
+            'User-Agent'      => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36',
+            'Accept-Language' => 'zh-CN,zh;q=0.9,en;q=0.8',
+        ],
+        'timeout' => 15,
+    ]);
+    if (is_wp_error($page)) wp_send_json_error('Không tải được trang YouTube.');
+    $html = wp_remote_retrieve_body($page);
+
+    // ── Bước 2: Lấy INNERTUBE_API_KEY ──
+    preg_match('/"INNERTUBE_API_KEY":"([^"]+)"/', $html, $m);
+    $api_key = $m[1] ?? 'AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8'; // fallback key
+
+    // ── Bước 3: Gọi Innertube player endpoint để lấy caption tracks ──
+    $player_resp = wp_remote_post('https://www.youtube.com/youtubei/v1/player?key=' . $api_key, [
+        'headers' => ['Content-Type' => 'application/json'],
+        'body'    => json_encode([
+            'context' => ['client' => ['clientName' => 'ANDROID', 'clientVersion' => '20.10.38']],
+            'videoId' => $video_id,
+        ]),
+        'timeout' => 15,
+    ]);
+    if (is_wp_error($player_resp)) wp_send_json_error('Không kết nối được Innertube.');
+
+    $player_data = json_decode(wp_remote_retrieve_body($player_resp), true);
+    $tracks      = $player_data['captions']['playerCaptionsTracklistRenderer']['captionTracks'] ?? [];
+    if (empty($tracks)) wp_send_json_error('Video này không có phụ đề / transcript.');
+
+    // ── Bước 4: Chọn track phù hợp (ưu tiên zh, zh-Hans, zh-Hant, asr) ──
+    $lang_codes   = [$lang, 'zh', 'zh-Hans', 'zh-Hant', 'zh-CN', 'zh-TW'];
+    $chosen_url   = null;
+    foreach ($lang_codes as $lc) {
+        foreach ($tracks as $track) {
+            if (isset($track['languageCode']) && stripos($track['languageCode'], $lc) !== false) {
+                $chosen_url = $track['baseUrl'];
+                break 2;
+            }
+        }
+    }
+    // Nếu không tìm được, dùng track đầu tiên
+    if (!$chosen_url) $chosen_url = $tracks[0]['baseUrl'] ?? null;
+    if (!$chosen_url) wp_send_json_error('Không tìm thấy track caption tiếng Trung.');
+
+    // ── Bước 5: Download XML transcript ──
+    $xml_resp = wp_remote_get($chosen_url . '&fmt=xml', ['timeout' => 15]);
+    if (is_wp_error($xml_resp)) wp_send_json_error('Không tải được transcript XML.');
+    $xml_body = wp_remote_retrieve_body($xml_resp);
+
+    // ── Bước 6: Parse XML → [{start, dur, text}] ──
+    libxml_use_internal_errors(true);
+    $xml = simplexml_load_string($xml_body);
+    if (!$xml) wp_send_json_error('Không parse được transcript XML.');
+
+    $segments = [];
+    foreach ($xml->text as $node) {
+        $start = (float)$node['start'];
+        $dur   = (float)$node['dur'];
+        $text  = html_entity_decode((string)$node, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+        $text  = preg_replace('/\s+/', ' ', trim($text));
+        if ($text === '') continue;
+        $segments[] = ['start' => round($start, 3), 'dur' => round($dur, 3), 'text' => $text];
+    }
+
+    if (empty($segments)) wp_send_json_error('Transcript trống.');
+
+    set_transient($cache_key, $segments, 6 * HOUR_IN_SECONDS);
+    wp_send_json_success($segments);
+}
+
+// ==========================================
+// 2. AJAX TÌM KIẾM
+// ==========================================
+add_action('wp_ajax_cysp_search',        'cysp_handle_ajax_search');
+add_action('wp_ajax_nopriv_cysp_search', 'cysp_handle_ajax_search');
+
+function cysp_handle_ajax_search() {
+    check_ajax_referer('cysp_search_secure_nonce', 'security');
+    $api_key = get_option('cysp_api_key');
+    if (empty($api_key)) wp_send_json_error('Quản trị viên chưa cấu hình API Key.');
+
+    $query    = isset($_POST['query'])    ? sanitize_text_field($_POST['query'])    : '';
+    $order    = isset($_POST['order'])    ? sanitize_text_field($_POST['order'])    : 'relevance';
+    $duration = isset($_POST['duration']) ? sanitize_text_field($_POST['duration']) : 'any';
+    $caption  = isset($_POST['caption'])  ? sanitize_text_field($_POST['caption'])  : 'closedCaption';
+    $lang     = isset($_POST['lang'])     ? sanitize_text_field($_POST['lang'])     : 'zh-Hans';
+
+    $api_query = $query;
+    if ($caption === 'closedCaption') $api_query .= ' "中文字幕"';
+
+    $cache_key = 'cysp_yt_' . md5($api_query . $order . $duration . $caption . $lang);
+    $cached    = get_transient($cache_key);
+    if ($cached !== false) wp_send_json_success($cached);
+
+    $url = "https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=12&type=video"
+         . "&q=" . urlencode($api_query) . "&order=" . $order
+         . "&videoDuration=" . $duration . "&relevanceLanguage=" . $lang . "&key=" . $api_key;
+    if ($caption === 'closedCaption') $url .= "&videoCaption=closedCaption";
+
+    $response = wp_remote_get($url);
+    if (is_wp_error($response)) wp_send_json_error('Lỗi kết nối máy chủ.');
+
+    $data = json_decode(wp_remote_retrieve_body($response));
+    if (isset($data->error)) wp_send_json_error($data->error->message);
+
+    set_transient($cache_key, $data->items, 12 * HOUR_IN_SECONDS);
+    wp_send_json_success($data->items);
+}
+
+// ==========================================
+// 3. SHORTCODE HTML
+// ==========================================
+add_shortcode('yt_search_player', 'cysp_shortcode_html');
+function cysp_shortcode_html() {
+    wp_enqueue_script('jquery');
+    ob_start(); ?>
+
+<div id="cysp-container">
+
+    <!-- SEARCH -->
+    <div class="cysp-search-wrapper">
+        <div class="cysp-search-bar">
+            <input type="text" id="cysp-search-input" placeholder="Tìm kiếm video học tiếng Trung..." />
+            <button id="cysp-search-btn">Tìm kiếm</button>
+        </div>
+        <div class="cysp-suggestions-container">
+            <div class="cysp-row-label">Cấp độ HSK:</div>
+            <div class="cysp-suggestions-row">
+                <span class="cysp-tag" data-kw="HSK 1">HSK 1</span>
+                <span class="cysp-tag" data-kw="HSK 2">HSK 2</span>
+                <span class="cysp-tag" data-kw="HSK 3">HSK 3</span>
+                <span class="cysp-tag" data-kw="HSK 4">HSK 4</span>
+                <span class="cysp-tag" data-kw="HSK 5">HSK 5</span>
+                <span class="cysp-tag" data-kw="HSK 6">HSK 6</span>
+                <span class="cysp-tag" data-kw="HSK 7-9">HSK 7-9</span>
+            </div>
+            <div class="cysp-row-label">Cấp độ HSKK:</div>
+            <div class="cysp-suggestions-row">
+                <span class="cysp-tag hskk-tag" data-kw="HSKK Sơ cấp">HSKK Sơ cấp</span>
+                <span class="cysp-tag hskk-tag" data-kw="HSKK Trung cấp">HSKK Trung cấp</span>
+                <span class="cysp-tag hskk-tag" data-kw="HSKK Cao cấp">HSKK Cao cấp</span>
+            </div>
+        </div>
+        <div class="cysp-filters">
+            <div class="filter-group">
+                <label>🔤 Loại chữ:</label>
+                <select id="cysp-lang">
+                    <option value="zh-Hans">Giản thể</option>
+                    <option value="zh-Hant">Phồn thể</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label>💬 Phụ đề:</label>
+                <select id="cysp-caption">
+                    <option value="closedCaption">Bắt buộc CC</option>
+                    <option value="any">Bất kỳ</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label>⏱ Thời lượng:</label>
+                <select id="cysp-duration">
+                    <option value="any">Tất cả</option>
+                    <option value="short">Ngắn</option>
+                    <option value="medium">Vừa</option>
+                    <option value="long">Dài</option>
+                </select>
+            </div>
+        </div>
+    </div>
+
+    <!-- PLAYER -->
+    <div id="cysp-player-container">
+
+        <!-- YT Player + Shield Overlay (cùng wrapper) -->
+        <div class="cysp-iframe-wrapper">
+            <!-- YT.Player sẽ thay thế div này -->
+            <div id="cysp-yt-player"></div>
+
+            <!-- SHIELD OVERLAY – che toàn bộ video khi luyện tập -->
+            <div id="cysp-shield">
+                <div class="shield-inner">
+                    <div class="shield-icon">🙈</div>
+                    <p class="shield-msg" id="shield-msg">Màn hình đã bị che.<br>Hãy lắng nghe và luyện tập!</p>
+                    <div class="shield-countdown" id="shield-countdown"></div>
+                    <button class="shield-reveal-btn" id="shield-reveal-btn" style="display:none;">
+                        👁 Hiện lại video
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- MODE TOOLBAR -->
+        <div id="cysp-mode-toolbar">
+            <button class="cysp-mode-btn active" data-mode="normal">▶ Xem thường</button>
+            <button class="cysp-mode-btn"        data-mode="dictation">✏️ Dictation</button>
+            <button class="cysp-mode-btn"        data-mode="shadowing">🎤 Shadowing</button>
+        </div>
+
+        <!-- ─── DICTATION PANEL ─── -->
+        <div id="cysp-dictation-panel" class="cysp-practice-panel" style="display:none;">
+            <div class="panel-header">
+                <h3>✏️ Chế độ Dictation – Luyện nghe &amp; chép chính tả</h3>
+                <p class="panel-desc">Chọn câu từ danh sách bên dưới hoặc dùng ⬆⬇ để chuyển câu. Nhấn <strong>▶ Phát câu này</strong> để nghe đúng 1 câu hoàn chỉnh, màn hình tự che. Gõ lại rồi nhấn <strong>✅ Kiểm tra</strong>.</p>
+            </div>
+
+            <div id="cysp-transcript-loading" class="transcript-loading" style="display:none;">⏳ Đang tải danh sách câu…</div>
+            <div id="cysp-transcript-error"  class="transcript-error"  style="display:none;"></div>
+            <div id="cysp-transcript-list"   class="transcript-list"   style="display:none;"></div>
+
+            <div class="dict-controls">
+                <button class="cysp-ctrl-btn green" id="dict-play-btn" disabled>▶ Phát câu này</button>
+                <button class="cysp-ctrl-btn" id="dict-replay-btn" disabled>🔁 Nghe lại</button>
+                <button class="cysp-ctrl-btn" id="dict-prev-btn" disabled>⬆ Câu trước</button>
+                <button class="cysp-ctrl-btn" id="dict-next-btn" disabled>⬇ Câu tiếp</button>
+                <button class="cysp-ctrl-btn danger" id="dict-clear-btn">🗑 Xoá</button>
+            </div>
+
+            <div id="dict-sentence-display" class="sentence-display" style="display:none;">
+                <span class="sentence-label">📌 Câu đang chọn:</span>
+                <span id="dict-sentence-text" class="sentence-text-blur">—</span>
+                <span id="dict-sentence-idx" class="sentence-idx"></span>
+            </div>
+
+            <div class="dict-status-bar" id="dict-status-bar">
+                <span id="dict-status-text">Nhấn ▶ Phát câu để bắt đầu.</span>
+                <div class="dict-progress-wrap"><div class="dict-progress-bar" id="dict-progress-bar"></div></div>
+            </div>
+
+            <div class="dict-input-area">
+                <textarea id="dict-input"
+                          placeholder="Gõ những gì bạn nghe được bằng tiếng Trung hoặc pinyin...&#10;Nhấn Ctrl+Enter để kiểm tra."
+                          rows="4" disabled></textarea>
+                <button id="dict-check-btn" disabled>✅ Kiểm tra<br><small>&amp; Hiện video</small></button>
+            </div>
+
+            <div id="dict-result" class="dict-result-box" style="display:none;"></div>
+
+            <div class="dict-stats">
+                <span>🎯 Độ chính xác phiên này: <strong id="dict-accuracy">—</strong></span>
+                <span>📝 Số lần thử: <strong id="dict-attempts">0</strong></span>
+            </div>
+
+            <div class="dict-tip">
+                💡 <strong>Quy trình:</strong> Phát câu → màn hình tự che → gõ nội dung → Kiểm tra (video hiện lại). Dùng 🔁 để nghe lại nhiều lần trước khi kiểm tra.
+            </div>
+        </div>
+
+        <!-- ─── SHADOWING PANEL ─── -->
+        <div id="cysp-shadowing-panel" class="cysp-practice-panel" style="display:none;">
+            <div class="panel-header">
+                <h3>🎤 Chế độ Shadowing – Luyện phát âm theo người bản ngữ</h3>
+                <p class="panel-desc">Chọn câu từ danh sách, nhấn <strong>▶ Phát câu này</strong> để nghe đúng 1 câu hoàn chỉnh (màn hình che). Sau đó thu âm và so sánh.</p>
+            </div>
+
+            <div class="shadow-controls-row">
+                <button class="cysp-ctrl-btn green" id="shadow-play-btn-main" disabled>▶ Phát câu này</button>
+                <button class="cysp-ctrl-btn" id="shadow-replay-btn" disabled>🔁 Nghe lại</button>
+                <button class="cysp-ctrl-btn" id="shadow-prev-btn" disabled>⬆ Câu trước</button>
+                <button class="cysp-ctrl-btn" id="shadow-next-btn" disabled>⬇ Câu tiếp</button>
+            </div>
+
+            <div id="shadow-sentence-display" class="sentence-display" style="display:none;">
+                <span class="sentence-label">📌 Câu đang chọn:</span>
+                <span id="shadow-sentence-text" class="sentence-text-blur">—</span>
+                <span id="shadow-sentence-idx" class="sentence-idx"></span>
+            </div>
+
+            <div class="dict-status-bar" id="shadow-status-bar">
+                <span id="shadow-status-text">Nhấn ▶ Phát câu để bắt đầu.</span>
+                <div class="dict-progress-wrap"><div class="dict-progress-bar" id="shadow-progress-bar"></div></div>
+            </div>
+
+            <div class="shadow-speed-row">
+                <label>🐢 Tốc độ:</label>
+                <div class="speed-btns">
+                    <button class="speed-btn" data-rate="0.5">0.5×</button>
+                    <button class="speed-btn" data-rate="0.75">0.75×</button>
+                    <button class="speed-btn active" data-rate="1">1×</button>
+                    <button class="speed-btn" data-rate="1.25">1.25×</button>
+                </div>
+            </div>
+
+            <div class="shadow-record-area">
+                <div class="shadow-record-header">
+                    <span>🎙 Thu âm giọng bạn:</span>
+                    <div class="record-btns">
+                        <button class="cysp-ctrl-btn record" id="shadow-record-btn">⏺ Bắt đầu thu</button>
+                        <button class="cysp-ctrl-btn" id="shadow-listen-btn" disabled>▶ Nghe lại</button>
+                        <button class="cysp-ctrl-btn danger" id="shadow-clear-rec-btn" disabled>🗑 Xoá</button>
+                    </div>
+                </div>
+                <div id="shadow-waveform">
+                    <canvas id="shadow-canvas" width="600" height="60"></canvas>
+                    <span id="shadow-timer">00:00</span>
+                </div>
+                <div id="shadow-playback-area" style="display:none;">
+                    <audio id="shadow-audio" controls></audio>
+                </div>
+            </div>
+
+            <div class="shadow-checklist">
+                <p class="checklist-title">📋 Tự đánh giá phát âm:</p>
+                <label><input type="checkbox" id="chk-tone"> Thanh điệu đúng</label>
+                <label><input type="checkbox" id="chk-rhythm"> Nhịp điệu tự nhiên</label>
+                <label><input type="checkbox" id="chk-fluency"> Lưu loát, không vấp</label>
+                <label><input type="checkbox" id="chk-vocab"> Phát âm từ mới chính xác</label>
+            </div>
+
+            <div class="shadow-log">
+                <p class="log-title">📊 Lịch sử luyện tập:</p>
+                <ul id="shadow-log-list"><li class="log-empty">Chưa có bản ghi nào.</li></ul>
+            </div>
+
+            <div class="dict-tip">
+                💡 <strong>Kỹ thuật:</strong> Nghe câu → màn hình che → thu âm ngay → nghe lại → so sánh → lặp 3–5 lần.
+            </div>
+        </div>
+    </div><!-- /player-container -->
+
+    <div id="cysp-loading">⏳ Đang tìm kiếm bài học phù hợp...</div>
+    <div id="cysp-results"></div>
+</div>
+
+    <?php
+    return ob_get_clean();
+}
+
+// ==========================================
+// 4. CSS + JS
+// ==========================================
+add_action('wp_footer', 'cysp_inject_scripts_and_styles', 100);
+function cysp_inject_scripts_and_styles() {
+    global $post;
+    if (!is_a($post, 'WP_Post') || !has_shortcode($post->post_content, 'yt_search_player')) return;
+
+    $ajax_url = admin_url('admin-ajax.php');
+    $nonce    = wp_create_nonce('cysp_search_secure_nonce');
+    ?>
+<style>
+/* ═══════════════════════════════ BASE ═══════════════════════════════ */
+#cysp-container { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 1000px; margin: auto; }
+
+/* ═══════════════════════════════ SEARCH ════════════════════════════ */
+.cysp-search-wrapper { margin-bottom: 25px; padding: 20px; background: #fff; border: 1px solid #eee; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+.cysp-search-bar { display: flex; gap: 10px; margin-bottom: 20px; }
+#cysp-search-input { flex: 1; padding: 12px 15px; border: 2px solid #eee; border-radius: 8px; font-size: 16px; transition: .3s; }
+#cysp-search-input:focus { border-color: #d32f2f; outline: none; }
+#cysp-search-btn { padding: 12px 25px; cursor: pointer; background: #d32f2f; color: #fff; border: none; border-radius: 8px; font-weight: bold; }
+.cysp-suggestions-container { margin-bottom: 20px; border-top: 1px solid #f5f5f5; padding-top: 15px; }
+.cysp-row-label { font-size: 12px; font-weight: bold; color: #888; margin-bottom: 8px; text-transform: uppercase; letter-spacing: .5px; }
+.cysp-suggestions-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 15px; }
+.cysp-tag { background: #f8f9fa; padding: 6px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; border: 1px solid #e9ecef; transition: .2s; color: #495057; }
+.cysp-tag:hover { background: #d32f2f; color: #fff; border-color: #d32f2f; }
+.hskk-tag { background: #fff3e0; border-color: #ffe0b2; }
+.hskk-tag:hover { background: #fb8c00; border-color: #fb8c00; }
+.cysp-filters { display: flex; flex-wrap: wrap; gap: 15px; font-size: 14px; background: #fcfcfc; padding: 12px; border-radius: 8px; border: 1px solid #f0f0f0; }
+.filter-group { display: flex; align-items: center; gap: 8px; }
+.filter-group label { font-weight: 600; color: #555; }
+.filter-group select { padding: 5px 10px; border-radius: 5px; border: 1px solid #ddd; }
+
+/* ═══════════════════════════════ PLAYER ════════════════════════════ */
+#cysp-player-container { display: none; margin-bottom: 30px; background: #000; border-radius: 12px; overflow: hidden; }
+
+/* Wrapper: vị trí relative để overlay nằm chồng lên */
+.cysp-iframe-wrapper { position: relative; padding-bottom: 56.25%; height: 0; background: #000; }
+#cysp-yt-player,
+.cysp-iframe-wrapper iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+
+/* ═══════════════════════════════ SHIELD OVERLAY ════════════════════ */
+#cysp-shield {
+    display: none;                 /* ẩn mặc định */
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 60%, #16213e 100%);
+    align-items: center;
+    justify-content: center;
+}
+#cysp-shield.active { display: flex; }
+
+.shield-inner { text-align: center; color: #fff; padding: 20px; }
+.shield-icon  { font-size: 56px; margin-bottom: 14px; animation: float 3s ease-in-out infinite; }
+@keyframes float { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-10px); } }
+.shield-msg   { font-size: 16px; color: #b0b8d1; line-height: 1.6; margin: 0 0 18px; }
+.shield-countdown { font-size: 42px; font-weight: 800; color: #d32f2f; letter-spacing: 2px; min-height: 54px; }
+.shield-reveal-btn {
+    margin-top: 18px; padding: 12px 32px;
+    background: #d32f2f; color: #fff; border: none;
+    border-radius: 50px; font-size: 16px; font-weight: 700;
+    cursor: pointer; letter-spacing: .5px;
+    box-shadow: 0 4px 20px rgba(211,47,47,.4);
+    transition: .2s;
+}
+.shield-reveal-btn:hover { background: #b71c1c; transform: scale(1.04); }
+
+/* ═══════════════════════════════ TOOLBAR ═══════════════════════════ */
+#cysp-mode-toolbar { display: flex; background: #1a1a2e; }
+.cysp-mode-btn { flex: 1; padding: 12px; border: none; background: transparent; color: #aaa; font-size: 14px; font-weight: 600; cursor: pointer; transition: .2s; border-bottom: 3px solid transparent; }
+.cysp-mode-btn:hover { color: #fff; background: rgba(255,255,255,.05); }
+.cysp-mode-btn.active { color: #fff; border-bottom-color: #d32f2f; background: rgba(211,47,47,.1); }
+
+/* ═══════════════════════════════ PRACTICE PANELS ═══════════════════ */
+.cysp-practice-panel { background: #fff; padding: 22px 24px; border: 1px solid #e8e8e8; border-top: none; border-radius: 0 0 12px 12px; }
+.panel-header h3 { margin: 0 0 6px; font-size: 17px; color: #1a1a2e; }
+.panel-desc { margin: 0 0 18px; color: #666; font-size: 13px; line-height: 1.6; }
+
+/* ── Status / Progress bar ── */
+.dict-status-bar { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; background: #f5f7ff; padding: 10px 14px; border-radius: 8px; font-size: 13px; color: #444; }
+.dict-progress-wrap { flex: 1; background: #e0e5f0; border-radius: 50px; height: 8px; overflow: hidden; }
+.dict-progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #d32f2f, #ff6b6b); border-radius: 50px; transition: width .1s linear; }
+
+/* ── Dictation controls ── */
+.dict-controls { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; padding: 12px; background: #f8f9fa; border-radius: 8px; font-size: 14px; }
+.dict-controls label { font-weight: 600; color: #555; }
+.dict-controls select { padding: 5px 8px; border-radius: 5px; border: 1px solid #ddd; }
+.dict-input-area { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 14px; }
+#dict-input { flex: 1; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 16px; font-family: inherit; resize: vertical; line-height: 1.6; transition: .2s; }
+#dict-input:focus { border-color: #d32f2f; outline: none; }
+#dict-input:disabled { background: #f5f5f5; cursor: not-allowed; }
+#dict-check-btn { padding: 10px 18px; background: #388e3c; color: #fff; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; white-space: nowrap; font-size: 13px; text-align: center; line-height: 1.4; }
+#dict-check-btn:hover:not(:disabled) { background: #2e7d32; }
+#dict-check-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+.dict-result-box { padding: 14px 16px; border-radius: 8px; margin-bottom: 14px; font-size: 14px; line-height: 1.9; border: 1px solid #e0e0e0; }
+.dict-result-box.correct { background: #e8f5e9; border-color: #a5d6a7; }
+.dict-result-box.partial  { background: #fff8e1; border-color: #ffe082; }
+.dict-result-box.wrong    { background: #ffebee; border-color: #ef9a9a; }
+.dict-char-correct { color: #2e7d32; font-weight: bold; }
+.dict-char-wrong   { color: #c62828; text-decoration: underline; background: #ffcdd2; border-radius: 2px; padding: 0 1px; }
+.dict-stats { display: flex; gap: 20px; font-size: 13px; color: #555; margin-bottom: 12px; }
+.dict-stats strong { color: #1a1a2e; }
+.dict-tip { font-size: 12px; color: #888; background: #f5f5f5; padding: 10px 14px; border-radius: 6px; border-left: 3px solid #d32f2f; line-height: 1.6; }
+
+/* ── Shadowing ── */
+.shadow-controls-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px; background: #f8f9fa; border-radius: 8px; margin-bottom: 14px; font-size: 14px; }
+.shadow-controls-row label { font-weight: 600; color: #555; }
+.shadow-controls-row select { padding: 5px 8px; border: 1px solid #ddd; border-radius: 5px; }
+.shadow-speed-row { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; font-size: 14px; }
+.shadow-speed-row label { font-weight: 600; color: #555; }
+.speed-btns { display: flex; gap: 6px; }
+.speed-btn { padding: 5px 14px; border: 2px solid #ddd; border-radius: 6px; background: #fff; cursor: pointer; font-size: 13px; font-weight: 600; color: #555; transition: .2s; }
+.speed-btn:hover { border-color: #d32f2f; color: #d32f2f; }
+.speed-btn.active { background: #d32f2f; border-color: #d32f2f; color: #fff; }
+
+.shadow-record-area { background: #f8f9fa; border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+.shadow-record-header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; font-weight: 600; color: #333; }
+.record-btns { display: flex; gap: 8px; }
+#shadow-waveform { display: flex; align-items: center; gap: 10px; background: #1a1a2e; border-radius: 8px; padding: 8px 12px; }
+#shadow-canvas { flex: 1; }
+#shadow-timer { color: #fff; font-size: 13px; font-family: monospace; min-width: 40px; }
+#shadow-playback-area { margin-top: 12px; }
+#shadow-audio { width: 100%; height: 36px; }
+
+.shadow-checklist { margin-bottom: 16px; }
+.checklist-title { font-weight: 600; color: #333; margin-bottom: 8px; font-size: 14px; }
+.shadow-checklist label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: #555; margin-right: 16px; cursor: pointer; }
+.shadow-checklist input[type=checkbox] { accent-color: #d32f2f; width: 15px; height: 15px; }
+.shadow-log { font-size: 13px; }
+.log-title { font-weight: 600; color: #333; margin-bottom: 8px; }
+#shadow-log-list { list-style: none; padding: 0; margin: 0; max-height: 140px; overflow-y: auto; }
+#shadow-log-list li { padding: 6px 10px; border-radius: 6px; background: #f0f4ff; margin-bottom: 5px; color: #333; }
+#shadow-log-list li.log-empty { color: #aaa; background: none; font-style: italic; }
+
+/* ── Shared buttons ── */
+.cysp-ctrl-btn { padding: 7px 16px; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; background: #1a1a2e; color: #fff; transition: .2s; }
+.cysp-ctrl-btn:hover:not(:disabled) { opacity: .85; }
+.cysp-ctrl-btn:disabled { opacity: .4; cursor: not-allowed; }
+.cysp-ctrl-btn.danger  { background: #c62828; }
+.cysp-ctrl-btn.green   { background: #388e3c; }
+.cysp-ctrl-btn.record  { background: #c62828; }
+.cysp-ctrl-btn.record.recording { background: #388e3c; animation: pulse-rec 1s infinite; }
+@keyframes pulse-rec { 0%,100% { opacity:1; } 50% { opacity:.6; } }
+
+/* ── Transcript list ── */
+.transcript-loading { padding: 12px 16px; color: #888; font-size: 13px; font-style: italic; }
+.transcript-error   { padding: 12px 16px; color: #c62828; font-size: 13px; background: #ffebee; border-radius: 8px; margin-bottom: 12px; }
+.transcript-list    { max-height: 220px; overflow-y: auto; border: 1px solid #e8e8e8; border-radius: 8px; margin-bottom: 14px; }
+.tr-sentence        { padding: 9px 14px; font-size: 14px; cursor: pointer; border-bottom: 1px solid #f5f5f5; display: flex; align-items: baseline; gap: 10px; transition: background .15s; }
+.tr-sentence:last-child { border-bottom: none; }
+.tr-sentence:hover  { background: #f0f4ff; }
+.tr-sentence.active { background: #fff3e0; border-left: 3px solid #fb8c00; }
+.tr-num             { font-size: 11px; color: #aaa; min-width: 28px; }
+.tr-time            { font-size: 11px; color: #bbb; min-width: 44px; white-space: nowrap; }
+.tr-text            { flex: 1; color: #1a1a2e; line-height: 1.5; }
+
+/* ── Current sentence display ── */
+.sentence-display   { display: flex; align-items: center; gap: 10px; padding: 10px 14px; background: #fff8e1; border: 1px solid #ffe082; border-radius: 8px; margin-bottom: 14px; font-size: 14px; }
+.sentence-label     { font-weight: 600; color: #e65100; white-space: nowrap; }
+.sentence-text-blur { flex: 1; color: #1a1a2e; font-size: 16px; filter: blur(5px); transition: filter .4s; user-select: none; }
+.sentence-text-blur.revealed { filter: blur(0); }
+.sentence-idx       { font-size: 12px; color: #aaa; white-space: nowrap; }
+
+
+#cysp-loading { display: none; text-align: center; padding: 20px; font-weight: bold; color: #d32f2f; }
+#cysp-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 20px; }
+.cysp-item { cursor: pointer; transition: .3s; border-radius: 10px; overflow: hidden; background: #fff; border: 1px solid #eee; }
+.cysp-item:hover { transform: translateY(-5px); box-shadow: 0 8px 20px rgba(0,0,0,.1); }
+.cysp-thumb-wrap { position: relative; height: 130px; }
+.cysp-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
+.cysp-cc-badge { position: absolute; bottom: 8px; right: 8px; background: #d32f2f; color: #fff; font-size: 10px; padding: 2px 5px; border-radius: 3px; font-weight: bold; }
+.cysp-info { padding: 12px; }
+.cysp-title { font-size: 14px; font-weight: 600; margin: 0 0 5px; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.cysp-channel { font-size: 12px; color: #888; }
+</style>
+
+<script>
+/* ──────────────────────────────────────────────────────────────────
+   GLOBAL: YT IFrame API callback
+   YouTube sẽ gọi onYouTubeIframeAPIReady() sau khi load xong SDK
+────────────────────────────────────────────────────────────────── */
+var cyspPlayer           = null;   // YT.Player instance
+var cyspCurrentMode      = 'normal';
+var cyspSentenceStart    = 0;      // thời điểm bắt đầu câu hiện tại (giây)
+var cyspPauseTimer       = null;   // setTimeout để pause sau X giây
+var cyspProgressInterval = null;
+var cyspCurrentVid       = '';
+var cyspCurrentLp        = 'zh-CN';
+var cyspRevealOnPlay     = false;  // cờ: ẩn shield ngay khi player bắt đầu PLAYING
+
+function onYouTubeIframeAPIReady() {
+    // Player sẽ được khởi tạo khi người dùng chọn video
+}
+
+function cyspInitPlayer(videoId, langPref) {
+    cyspCurrentVid = videoId;
+    cyspCurrentLp  = langPref;
+
+    if (cyspPlayer) {
+        cyspPlayer.loadVideoById(videoId);
+        return;
+    }
+
+    cyspPlayer = new YT.Player('cysp-yt-player', {
+        videoId: videoId,
+        playerVars: {
+            autoplay:       1,
+            cc_load_policy: 1,
+            hl:             langPref,
+            cc_lang_pref:   langPref,
+            rel:            0,
+            modestbranding: 1
+        },
+        events: {
+            onReady: function(e) { e.target.playVideo(); },
+            onStateChange: function(e) {
+                // Ẩn shield ngay khi player thật sự bắt đầu phát (sau seekTo)
+                if (e.data === YT.PlayerState.PLAYING && cyspRevealOnPlay) {
+                    cyspRevealOnPlay = false;
+                    cyspHideShield();
+                }
+                // Nếu video kết thúc trong khi luyện, ẩn shield
+                if (e.data === YT.PlayerState.ENDED) {
+                    cyspRevealOnPlay = false;
+                    cyspHideShield();
+                }
+            }
+        }
+    });
+}
+
+/* Điều khiển shield */
+function cyspShowShield(msgHtml) {
+    var s = document.getElementById('cysp-shield');
+    if (msgHtml) document.getElementById('shield-msg').innerHTML = msgHtml;
+    s.classList.add('active');
+}
+function cyspHideShield() {
+    cyspRevealOnPlay = false;
+    document.getElementById('cysp-shield').classList.remove('active');
+    document.getElementById('shield-reveal-btn').style.display = 'none';
+    document.getElementById('shield-countdown').textContent = '';
+}
+/* Seek về đầu câu + play; shield tự ẩn ngay khi frame đầu tiên hiện (onStateChange PLAYING) */
+function cyspRevealAndReplay() {
+    if (!cyspPlayer) { cyspHideShield(); return; }
+    cyspRevealOnPlay = true;
+    cyspPlayer.seekTo(cyspSentenceStart, true);
+    cyspPlayer.playVideo();
+}
+
+/* Phát 1 câu rồi dừng và che màn hình
+   @param durSec   – số giây phát
+   @param onDone   – callback sau khi dừng
+   @param progressBarId – id của thanh tiến trình */
+function cyspPlaySentence(durSec, onDone, progressBarId, statusTextId) {
+    if (!cyspPlayer) return;
+
+    clearTimeout(cyspPauseTimer);
+    clearInterval(cyspProgressInterval);
+
+    // Lưu vị trí hiện tại làm điểm bắt đầu câu
+    cyspSentenceStart = cyspPlayer.getCurrentTime();
+
+    // Che màn hình ngay, hiện đếm ngược
+    cyspShowShield('🎵 Đang phát… hãy lắng nghe!');
+    document.getElementById('shield-reveal-btn').style.display = 'none';
+
+    var elapsed = 0;
+    var interval = 100; // ms
+    var progressEl = document.getElementById(progressBarId);
+    var statusEl   = document.getElementById(statusTextId);
+    if (statusEl) statusEl.textContent = 'Đang phát…';
+
+    // Countdown trên shield
+    var cdEl = document.getElementById('shield-countdown');
+
+    cyspProgressInterval = setInterval(function() {
+        elapsed += interval;
+        var pct = Math.min(elapsed / (durSec * 1000) * 100, 100);
+        if (progressEl) progressEl.style.width = pct + '%';
+        var remaining = Math.ceil((durSec * 1000 - elapsed) / 1000);
+        if (cdEl) cdEl.textContent = remaining > 0 ? remaining : '';
+    }, interval);
+
+    cyspPlayer.playVideo();
+
+    cyspPauseTimer = setTimeout(function() {
+        clearInterval(cyspProgressInterval);
+        cyspPlayer.pauseVideo();
+        if (progressEl) progressEl.style.width = '100%';
+        if (cdEl) cdEl.textContent = '';
+
+        // Cập nhật shield: yêu cầu nhập liệu
+        document.getElementById('shield-msg').innerHTML =
+            '✏️ Video đã dừng.<br>Hãy gõ / nói lại những gì bạn nghe được!';
+
+        if (onDone) onDone();
+    }, durSec * 1000);
+}
+
+/* ──────────────────────────────────────────────────────────────────
+   jQuery logic
+────────────────────────────────────────────────────────────────── */
+jQuery(document).ready(function($) {
+
+    /* ── SEARCH ── */
+    function performSearch() {
+        var query = $('#cysp-search-input').val().trim();
+        if (!query) return;
+        $('#cysp-results').empty();
+        $('#cysp-loading').fadeIn();
+
+        $.post('<?php echo $ajax_url; ?>', {
+            action:   'cysp_search',
+            security: '<?php echo $nonce; ?>',
+            query:    query,
+            lang:     $('#cysp-lang').val(),
+            duration: $('#cysp-duration').val(),
+            caption:  $('#cysp-caption').val()
+        }, function(res) {
+            $('#cysp-loading').hide();
+            if (!res.success) return;
+            $.each(res.data, function(i, item) {
+                var html = '<div class="cysp-item" data-vid="' + item.id.videoId + '">'
+                    + '<div class="cysp-thumb-wrap"><img src="' + item.snippet.thumbnails.medium.url + '" loading="lazy" />';
+                if ($('#cysp-caption').val() === 'closedCaption') html += '<span class="cysp-cc-badge">CC</span>';
+                html += '</div><div class="cysp-info">'
+                    + '<h4 class="cysp-title">' + item.snippet.title + '</h4>'
+                    + '<p class="cysp-channel">📺 ' + item.snippet.channelTitle + '</p>'
+                    + '</div></div>';
+                $('#cysp-results').append(html);
+            });
+        });
+    }
+
+    $('#cysp-search-btn').click(performSearch);
+    $('#cysp-search-input').keypress(function(e) { if (e.which === 13) performSearch(); });
+    $('.cysp-tag').click(function() { $('#cysp-search-input').val($(this).data('kw')); performSearch(); });
+
+    /* ── Load video ── */
+    $(document).on('click', '.cysp-item', function() {
+        var vid = $(this).data('vid');
+        var lp  = $('#cysp-lang').val() === 'zh-Hant' ? 'zh-TW' : 'zh-CN';
+        cyspHideShield();
+        cyspInitPlayer(vid, lp);
+        $('#cysp-player-container').slideDown();
+        switchMode('normal');
+        loadTranscript(vid, lp);
+        $('html, body').animate({ scrollTop: $('#cysp-container').offset().top - 20 }, 500);
+    });
+
+    /* ── Transcript ── */
+    var cyspTranscript    = [];
+    var cyspSentenceIndex = 0;
+
+    function loadTranscript(vid, lp) {
+        cyspTranscript    = [];
+        cyspSentenceIndex = 0;
+        disableSentenceControls();
+        $('#cysp-transcript-list, #cysp-transcript-error').hide().empty();
+        $('#cysp-transcript-loading').show();
+
+        $.post('<?php echo $ajax_url; ?>', {
+            action:   'cysp_get_transcript',
+            security: '<?php echo $nonce; ?>',
+            video_id: vid,
+            lang:     lp
+        }, function(res) {
+            $('#cysp-transcript-loading').hide();
+            if (!res.success) {
+                $('#cysp-transcript-error').text('⚠️ ' + res.data).show();
+                return;
+            }
+            cyspTranscript = res.data;
+            renderTranscriptList();
+            selectSentence(0);
+            enableSentenceControls();
+        });
+    }
+
+    function renderTranscriptList() {
+        var $list = $('#cysp-transcript-list').empty().show();
+        $.each(cyspTranscript, function(i, seg) {
+            var t   = Math.floor(seg.start);
+            var min = Math.floor(t / 60), sec = t % 60;
+            var ts  = (min < 10 ? '0'+min : min) + ':' + (sec < 10 ? '0'+sec : sec);
+            $list.append('<div class="tr-sentence" data-idx="'+i+'">'
+                + '<span class="tr-num">'  + (i+1) + '</span>'
+                + '<span class="tr-time">' + ts    + '</span>'
+                + '<span class="tr-text">' + esc(seg.text) + '</span>'
+                + '</div>');
+        });
+        $list.on('click', '.tr-sentence', function() {
+            selectSentence(parseInt($(this).data('idx')));
+        });
+    }
+
+    function selectSentence(idx) {
+        if (!cyspTranscript.length) return;
+        idx = Math.max(0, Math.min(idx, cyspTranscript.length - 1));
+        cyspSentenceIndex = idx;
+
+        $('#cysp-transcript-list .tr-sentence').removeClass('active');
+        var $active = $('#cysp-transcript-list .tr-sentence[data-idx="'+idx+'"]');
+        $active.addClass('active');
+        var $list = $('#cysp-transcript-list');
+        if ($list.is(':visible')) {
+            $list.scrollTop($active.offset().top - $list.offset().top + $list.scrollTop() - 40);
+        }
+
+        var seg   = cyspTranscript[idx];
+        var label = 'Câu ' + (idx+1) + '/' + cyspTranscript.length + ' (' + Math.round(seg.dur*10)/10 + 'giây)';
+        $('#dict-sentence-text, #shadow-sentence-text').text(seg.text).removeClass('revealed');
+        $('#dict-sentence-idx,  #shadow-sentence-idx').text(label);
+        $('#dict-sentence-display, #shadow-sentence-display').show();
+
+        if (cyspPlayer && cyspCurrentMode !== 'normal') {
+            cyspPlayer.seekTo(seg.start, true);
+            cyspSentenceStart = seg.start;
+        }
+        dictResetForNewSentence();
+    }
+
+    function enableSentenceControls() {
+        $('#dict-play-btn, #dict-prev-btn, #dict-next-btn').prop('disabled', false);
+        $('#shadow-play-btn-main, #shadow-prev-btn, #shadow-next-btn').prop('disabled', false);
+    }
+    function disableSentenceControls() {
+        $('#dict-play-btn, #dict-replay-btn, #dict-prev-btn, #dict-next-btn, #dict-check-btn').prop('disabled', true);
+        $('#shadow-play-btn-main, #shadow-replay-btn, #shadow-prev-btn, #shadow-next-btn').prop('disabled', true);
+    }
+
+    $('#dict-prev-btn').click(function()   { selectSentence(cyspSentenceIndex - 1); });
+    $('#dict-next-btn').click(function()   { selectSentence(cyspSentenceIndex + 1); });
+    $('#shadow-prev-btn').click(function() { selectSentence(cyspSentenceIndex - 1); });
+    $('#shadow-next-btn').click(function() { selectSentence(cyspSentenceIndex + 1); });
+
+    /* ── Mode switcher ── */
+    function switchMode(mode) {
+        cyspCurrentMode = mode;
+        $('.cysp-mode-btn').removeClass('active');
+        $('.cysp-mode-btn[data-mode="' + mode + '"]').addClass('active');
+        $('#cysp-dictation-panel, #cysp-shadowing-panel').hide();
+        cyspHideShield();
+        clearTimeout(cyspPauseTimer);
+        clearInterval(cyspProgressInterval);
+
+        if (mode === 'normal'    && cyspPlayer) cyspPlayer.playVideo();
+        if (mode === 'dictation') { $('#cysp-dictation-panel').show(); if (cyspPlayer) cyspPlayer.pauseVideo(); }
+        if (mode === 'shadowing') { $('#cysp-shadowing-panel').show(); if (cyspPlayer) cyspPlayer.pauseVideo(); }
+    }
+    $('.cysp-mode-btn').click(function() { switchMode($(this).data('mode')); });
+
+    $('#shield-reveal-btn').click(function() { cyspRevealAndReplay(); });
+
+    /* ════════════════════════════════════════════════════════
+       CORE: Phát đúng 1 câu theo transcript timestamp
+    ════════════════════════════════════════════════════════ */
+    function playSentenceByIndex(idx, onDone) {
+        if (!cyspPlayer || !cyspTranscript.length) return;
+        var seg   = cyspTranscript[idx];
+        var durMs = Math.round(seg.dur * 1000) + 200; // +200ms buffer
+        cyspSentenceStart = seg.start;
+
+        clearTimeout(cyspPauseTimer);
+        clearInterval(cyspProgressInterval);
+
+        cyspShowShield('🎵 Đang phát… hãy lắng nghe!');
+        document.getElementById('shield-reveal-btn').style.display = 'none';
+        $('#dict-status-text, #shadow-status-text').text('Đang phát câu ' + (idx+1) + '…');
+
+        var elapsed = 0;
+        var pdEl    = document.getElementById('dict-progress-bar');
+        var psEl    = document.getElementById('shadow-progress-bar');
+        var cdEl    = document.getElementById('shield-countdown');
+
+        cyspPlayer.seekTo(seg.start, true);
+        cyspPlayer.playVideo();
+
+        cyspProgressInterval = setInterval(function() {
+            elapsed += 100;
+            var pct = Math.min(elapsed / durMs * 100, 100);
+            if (pdEl) pdEl.style.width = pct + '%';
+            if (psEl) psEl.style.width = pct + '%';
+            var rem = Math.ceil((durMs - elapsed) / 1000);
+            if (cdEl) cdEl.textContent = rem > 0 ? rem : '';
+        }, 100);
+
+        cyspPauseTimer = setTimeout(function() {
+            clearInterval(cyspProgressInterval);
+            cyspPlayer.pauseVideo();
+            if (pdEl) pdEl.style.width = '100%';
+            if (psEl) psEl.style.width = '100%';
+            if (cdEl) cdEl.textContent = '';
+            document.getElementById('shield-msg').innerHTML =
+                '✏️ Video đã dừng.<br>Hãy gõ / nói lại những gì bạn nghe được!';
+            if (onDone) onDone();
+        }, durMs);
+    }
+
+    /* ════════════════════════════════════════════════════════
+       DICTATION
+    ════════════════════════════════════════════════════════ */
+    var dictAttempts     = 0;
+    var dictTotalChars   = 0;
+    var dictCorrectChars = 0;
+    var dictLastAnswer   = '';
+
+    function dictResetForNewSentence() {
+        $('#dict-input').val('').prop('disabled', true);
+        $('#dict-check-btn').prop('disabled', true);
+        $('#dict-replay-btn').prop('disabled', true);
+        $('#dict-result').hide();
+        $('#dict-progress-bar').css('width', '0%');
+        $('#dict-sentence-text').removeClass('revealed');
+        dictLastAnswer = '';
+    }
+
+    $('#dict-play-btn').click(function() {
+        if (!cyspPlayer) { alert('Hãy chọn một video trước.'); return; }
+        if (!cyspTranscript.length) { alert('Chưa tải được transcript.'); return; }
+        dictResetForNewSentence();
+        playSentenceByIndex(cyspSentenceIndex, function() {
+            $('#dict-input').prop('disabled', false).focus();
+            $('#dict-check-btn').prop('disabled', false);
+            $('#dict-replay-btn').prop('disabled', false);
+            $('#dict-status-text').text('Video đã dừng. Hãy gõ những gì bạn nghe!');
+        });
+    });
+
+    $('#dict-replay-btn').click(function() {
+        if (!cyspPlayer || !cyspTranscript.length) return;
+        $('#dict-input').prop('disabled', true);
+        $('#dict-check-btn').prop('disabled', true);
+        $('#dict-sentence-text').removeClass('revealed');
+        playSentenceByIndex(cyspSentenceIndex, function() {
+            $('#dict-input').prop('disabled', false).focus();
+            $('#dict-check-btn').prop('disabled', false);
+            $('#dict-status-text').text('Nghe lại xong. Tiếp tục gõ!');
+        });
+    });
+
+    $('#dict-clear-btn').click(function() {
+        dictResetForNewSentence();
+        $('#dict-status-text').text('Đã xoá. Nhấn ▶ Phát câu để bắt đầu.');
+    });
+
+    $('#dict-check-btn').click(runDictCheck);
+    $('#dict-input').keydown(function(e) { if (e.ctrlKey && e.which === 13) runDictCheck(); });
+
+    function runDictCheck() {
+        var userText = $('#dict-input').val().trim();
+        if (!userText) return;
+
+        dictAttempts++;
+        $('#dict-attempts').text(dictAttempts);
+
+        var origText = cyspTranscript.length ? cyspTranscript[cyspSentenceIndex].text : '';
+        var resultHtml, cls;
+
+        if (origText) {
+            var result = compareTexts(origText, userText);
+            cls = result.pct === 100 ? 'correct' : (result.pct >= 60 ? 'partial' : 'wrong');
+            var emoji = result.pct === 100 ? '✅' : (result.pct >= 60 ? '⚠️' : '❌');
+            dictTotalChars   += result.total;
+            dictCorrectChars += result.correct;
+            $('#dict-accuracy').text(dictTotalChars > 0 ? Math.round(dictCorrectChars / dictTotalChars * 100) + '%' : '—');
+            resultHtml = emoji + ' <strong>' + result.pct + '% chính xác</strong><br><br>'
+                + '<strong>Câu gốc:</strong> ' + result.html1 + '<br>'
+                + '<strong>Bạn gõ:</strong> '  + result.html2;
+        } else {
+            cls = 'partial';
+            resultHtml = '📝 <strong>Câu bạn gõ:</strong> <span style="font-size:17px;">' + esc(userText) + '</span>';
+        }
+
+        $('#dict-result').removeClass('correct partial wrong').addClass(cls).html(resultHtml).show();
+        $('#dict-sentence-text').addClass('revealed');
+        dictLastAnswer = userText;
+        cyspRevealAndReplay();
+        $('#dict-status-text').text('Đã kiểm tra! Video đang phát lại câu đó.');
+    }
+
+    /* ════════════════════════════════════════════════════════
+       SHADOWING
+    ════════════════════════════════════════════════════════ */
+    $('#shadow-play-btn-main').click(function() {
+        if (!cyspPlayer) { alert('Hãy chọn một video trước.'); return; }
+        if (!cyspTranscript.length) { alert('Chưa tải được transcript.'); return; }
+        $('#shadow-progress-bar').css('width', '0%');
+        playSentenceByIndex(cyspSentenceIndex, function() {
+            $('#shadow-replay-btn').prop('disabled', false);
+            $('#shadow-status-text').text('Video đã dừng. Hãy thu âm và bắt chước!');
+            document.getElementById('shield-reveal-btn').style.display = 'inline-block';
+        });
+    });
+
+    $('#shadow-replay-btn').click(function() {
+        if (!cyspPlayer || !cyspTranscript.length) return;
+        $('#shadow-progress-bar').css('width', '0%');
+        $('#shadow-sentence-text').removeClass('revealed');
+        playSentenceByIndex(cyspSentenceIndex, function() {
+            $('#shadow-status-text').text('Đã phát lại. Sẵn sàng thu âm!');
+            document.getElementById('shield-reveal-btn').style.display = 'inline-block';
+        });
+    });
+
+    function compareTexts(t1, t2) {
+        var len = Math.max(t1.length, t2.length), correct = 0, h1 = '', h2 = '';
+        for (var i = 0; i < len; i++) {
+            var c1 = i < t1.length ? t1[i] : '';
+            var c2 = i < t2.length ? t2[i] : '';
+            if (c1 && c2 && c1 === c2) {
+                correct++;
+                h1 += '<span class="dict-char-correct">' + esc(c1) + '</span>';
+                h2 += '<span class="dict-char-correct">' + esc(c2) + '</span>';
+            } else {
+                if (c1) h1 += '<span class="dict-char-wrong">' + esc(c1) + '</span>';
+                if (c2) h2 += '<span class="dict-char-wrong">' + esc(c2) + '</span>';
+            }
+        }
+        return { pct: len ? Math.round(correct / len * 100) : 0, total: len, correct: correct, html1: h1, html2: h2 };
+    }
+    function esc(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    /* Tốc độ video */
+    $('.speed-btn').click(function() {
+        $('.speed-btn').removeClass('active');
+        $(this).addClass('active');
+        if (cyspPlayer) cyspPlayer.setPlaybackRate(parseFloat($(this).data('rate')));
+    });
+
+    /* ── Thu âm ── */
+    var mediaRecorder = null, audioChunks = [], recordTimer = null;
+    var recordSeconds = 0, audioCtx = null, analyser = null;
+    var animFrame = null, isRecording = false;
+
+    $('#shadow-record-btn').click(function() {
+        if (!isRecording) startRecording(); else stopRecording();
+    });
+
+    function startRecording() {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+            alert('Trình duyệt không hỗ trợ thu âm.'); return;
+        }
+        navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+            isRecording = true; audioChunks = [];
+            mediaRecorder = new MediaRecorder(stream);
+            mediaRecorder.start();
+            mediaRecorder.addEventListener('dataavailable', function(e) { audioChunks.push(e.data); });
+            mediaRecorder.addEventListener('stop', function() {
+                var blob = new Blob(audioChunks, { type: 'audio/webm' });
+                $('#shadow-audio').attr('src', URL.createObjectURL(blob));
+                $('#shadow-playback-area').show();
+                $('#shadow-listen-btn, #shadow-clear-rec-btn').prop('disabled', false);
+                stream.getTracks().forEach(function(t) { t.stop(); });
+                addShadowLog();
+            });
+            recordSeconds = 0; updateRecTimer();
+            recordTimer = setInterval(updateRecTimer, 1000);
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioCtx.createAnalyser();
+            audioCtx.createMediaStreamSource(stream).connect(analyser);
+            drawWaveform();
+            $('#shadow-record-btn').text('⏹ Dừng thu').addClass('recording');
+        }).catch(function(err) { alert('Không thể truy cập micro: ' + err.message); });
+    }
+
+    function stopRecording() {
+        isRecording = false;
+        if (mediaRecorder) mediaRecorder.stop();
+        clearInterval(recordTimer);
+        cancelAnimationFrame(animFrame);
+        $('#shadow-record-btn').text('⏺ Bắt đầu thu').removeClass('recording');
+        clearCanvas();
+    }
+
+    function updateRecTimer() {
+        recordSeconds++;
+        var m = Math.floor(recordSeconds / 60), s = recordSeconds % 60;
+        $('#shadow-timer').text((m < 10 ? '0'+m : m) + ':' + (s < 10 ? '0'+s : s));
+    }
+
+    function drawWaveform() {
+        var cv = document.getElementById('shadow-canvas');
+        var cx = cv.getContext('2d'), W = cv.width, H = cv.height;
+        analyser.fftSize = 256;
+        var buf = new Uint8Array(analyser.frequencyBinCount);
+        (function draw() {
+            animFrame = requestAnimationFrame(draw);
+            analyser.getByteTimeDomainData(buf);
+            cx.fillStyle = '#1a1a2e'; cx.fillRect(0, 0, W, H);
+            cx.lineWidth = 2; cx.strokeStyle = '#d32f2f'; cx.beginPath();
+            var sw = W / buf.length, x = 0;
+            for (var i = 0; i < buf.length; i++) {
+                var y = buf[i] / 128 * H / 2;
+                i === 0 ? cx.moveTo(x, y) : cx.lineTo(x, y);
+                x += sw;
+            }
+            cx.lineTo(W, H / 2); cx.stroke();
+        })();
+    }
+
+    function clearCanvas() {
+        var cv = document.getElementById('shadow-canvas');
+        var cx = cv.getContext('2d');
+        cx.fillStyle = '#1a1a2e'; cx.fillRect(0, 0, cv.width, cv.height);
+        cx.strokeStyle = '#444'; cx.lineWidth = 1;
+        cx.beginPath(); cx.moveTo(0, cv.height / 2); cx.lineTo(cv.width, cv.height / 2); cx.stroke();
+    }
+
+    $('#shadow-listen-btn').click(function() { document.getElementById('shadow-audio').play(); });
+    $('#shadow-clear-rec-btn').click(function() {
+        $('#shadow-audio').attr('src', '');
+        $('#shadow-playback-area').hide();
+        $('#shadow-listen-btn, #shadow-clear-rec-btn').prop('disabled', true);
+        recordSeconds = 0; $('#shadow-timer').text('00:00'); clearCanvas();
+    });
+
+    function addShadowLog() {
+        var checks = [];
+        if ($('#chk-tone').is(':checked'))    checks.push('Thanh điệu ✓');
+        if ($('#chk-rhythm').is(':checked'))  checks.push('Nhịp điệu ✓');
+        if ($('#chk-fluency').is(':checked')) checks.push('Lưu loát ✓');
+        if ($('#chk-vocab').is(':checked'))   checks.push('Từ vựng ✓');
+        var now = new Date();
+        var t   = now.getHours() + ':' + String(now.getMinutes()).padStart(2,'0');
+        var txt = '🎤 ' + t + ' — ' + recordSeconds + 'giây';
+        if (checks.length) txt += ' | ' + checks.join(', ');
+        $('#shadow-log-list .log-empty').remove();
+        $('#shadow-log-list').prepend('<li>' + txt + '</li>');
+        $('#chk-tone, #chk-rhythm, #chk-fluency, #chk-vocab').prop('checked', false);
+    }
+
+    clearCanvas();
+}); // jQuery ready
+</script>
+
+<!-- Load YouTube IFrame API -->
+<script src="https://www.youtube.com/iframe_api" async></script>
+    <?php
+}
