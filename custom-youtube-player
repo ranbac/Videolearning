@@ -1,0 +1,265 @@
+/*
+Plugin Name: Custom YouTube Search Player (Chinese Learner Edition)
+Description: Tìm kiếm video có phụ đề, tối ưu cho người học tiếng Trung. V2.2: Cập nhật 2 hàng gợi ý HSK và HSKK.
+Version: 2.2
+Author: Bạn (Upgraded)
+*/
+
+// ==========================================
+// 1. TẠO MENU CÀI ĐẶT API KEY
+// ==========================================
+add_action('admin_menu', 'cysp_add_settings_page');
+function cysp_add_settings_page() {
+    add_options_page('YouTube API Settings', 'YouTube Player', 'manage_options', 'cysp-settings', 'cysp_render_settings_page');
+}
+
+function cysp_render_settings_page() {
+    ?>
+    <div class="wrap">
+        <h2>Cài đặt API Key cho Custom YouTube Player</h2>
+        <form method="post" action="options.php">
+            <?php settings_fields('cysp_settings_group'); ?>
+            <table class="form-table">
+                <tr valign="top">
+                <th scope="row">Nhập YouTube API Key:</th>
+                <td><input type="text" name="cysp_api_key" value="<?php echo esc_attr(get_option('cysp_api_key')); ?>" style="width:400px;" /></td>
+                </tr>
+            </table>
+            <?php submit_button('Lưu thay đổi'); ?>
+        </form>
+    </div>
+    <?php
+}
+
+add_action('admin_init', 'cysp_register_settings');
+function cysp_register_settings() {
+    register_setting('cysp_settings_group', 'cysp_api_key');
+}
+
+// ==========================================
+// 2. XỬ LÝ AJAX TÌM KIẾM
+// ==========================================
+add_action('wp_ajax_cysp_search', 'cysp_handle_ajax_search');
+add_action('wp_ajax_nopriv_cysp_search', 'cysp_handle_ajax_search');
+
+function cysp_handle_ajax_search() {
+    check_ajax_referer('cysp_search_secure_nonce', 'security');
+
+    $api_key = get_option('cysp_api_key');
+    if (empty($api_key)) {
+        wp_send_json_error('Quản trị viên chưa cấu hình API Key.');
+    }
+
+    $query = isset($_POST['query']) ? sanitize_text_field($_POST['query']) : '';
+    $order = isset($_POST['order']) ? sanitize_text_field($_POST['order']) : 'relevance';
+    $duration = isset($_POST['duration']) ? sanitize_text_field($_POST['duration']) : 'any';
+    $caption = isset($_POST['caption']) ? sanitize_text_field($_POST['caption']) : 'closedCaption';
+    $lang = isset($_POST['lang']) ? sanitize_text_field($_POST['lang']) : 'zh-Hans';
+
+    // Ép Phụ đề Tiếng Trung
+    $api_query = $query;
+    if ($caption === 'closedCaption') {
+        $api_query .= ' "中文字幕"'; 
+    }
+
+    // Cache results
+    $cache_key = 'cysp_yt_' . md5($api_query . $order . $duration . $caption . $lang);
+    $cached_results = get_transient($cache_key);
+
+    if ($cached_results !== false) {
+        wp_send_json_success($cached_results);
+    }
+
+    $url = "https://www.googleapis.com/youtube/v3/search?part=snippet&maxResults=12&type=video&q=" . urlencode($api_query) . "&order=" . $order . "&videoDuration=" . $duration . "&relevanceLanguage=" . $lang . "&key=" . $api_key;
+    
+    if ($caption === 'closedCaption') {
+        $url .= "&videoCaption=closedCaption";
+    }
+    
+    $response = wp_remote_get($url);
+    if (is_wp_error($response)) { wp_send_json_error('Lỗi kết nối máy chủ.'); }
+
+    $body = wp_remote_retrieve_body($response);
+    $data = json_decode($body);
+
+    if (isset($data->error)) { wp_send_json_error($data->error->message); }
+
+    set_transient($cache_key, $data->items, 12 * HOUR_IN_SECONDS);
+    wp_send_json_success($data->items);
+}
+
+// ==========================================
+// 3. GIAO DIỆN SHORTCODE
+// ==========================================
+add_shortcode('yt_search_player', 'cysp_shortcode_html');
+function cysp_shortcode_html() {
+    wp_enqueue_script('jquery');
+    ob_start();
+    ?>
+    <div id="cysp-container">
+        <div class="cysp-search-wrapper">
+            <div class="cysp-search-bar">
+                <input type="text" id="cysp-search-input" placeholder="Tìm kiếm video học tiếng Trung..." />
+                <button id="cysp-search-btn">Tìm kiếm</button>
+            </div>
+
+            <div class="cysp-suggestions-container">
+                <div class="cysp-row-label">Cấp độ HSK:</div>
+                <div class="cysp-suggestions-row">
+                    <span class="cysp-tag" data-kw="HSK 1">HSK 1</span>
+                    <span class="cysp-tag" data-kw="HSK 2">HSK 2</span>
+                    <span class="cysp-tag" data-kw="HSK 3">HSK 3</span>
+                    <span class="cysp-tag" data-kw="HSK 4">HSK 4</span>
+                    <span class="cysp-tag" data-kw="HSK 5">HSK 5</span>
+                    <span class="cysp-tag" data-kw="HSK 6">HSK 6</span>
+                    <span class="cysp-tag" data-kw="HSK 7-9">HSK 7-9</span>
+                </div>
+
+                <div class="cysp-row-label">Cấp độ HSKK:</div>
+                <div class="cysp-suggestions-row">
+                    <span class="cysp-tag hskk-tag" data-kw="HSKK Sơ cấp">HSKK Sơ cấp</span>
+                    <span class="cysp-tag hskk-tag" data-kw="HSKK Trung cấp">HSKK Trung cấp</span>
+                    <span class="cysp-tag hskk-tag" data-kw="HSKK Cao cấp">HSKK Cao cấp</span>
+                </div>
+            </div>
+            
+            <div class="cysp-filters">
+                <div class="filter-group">
+                    <label>🔤 Loại chữ:</label>
+                    <select id="cysp-lang">
+                        <option value="zh-Hans">Giản thể</option>
+                        <option value="zh-Hant">Phồn thể</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>💬 Phụ đề:</label>
+                    <select id="cysp-caption">
+                        <option value="closedCaption">Bắt buộc CC</option>
+                        <option value="any">Bất kỳ</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>⏱ Thời lượng:</label>
+                    <select id="cysp-duration">
+                        <option value="any">Tất cả</option>
+                        <option value="short">Ngắn</option>
+                        <option value="medium">Vừa</option>
+                        <option value="long">Dài</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+
+        <div id="cysp-player-container">
+            <div class="cysp-iframe-wrapper">
+                <iframe id="cysp-iframe" src="" frameborder="0" allow="autoplay; encrypted-media" allowfullscreen></iframe>
+            </div>
+        </div>
+
+        <div id="cysp-loading">⏳ Đang tìm kiếm bài học phù hợp...</div>
+        <div id="cysp-results"></div>
+    </div>
+    <?php
+    return ob_get_clean();
+}
+
+// ==========================================
+// 4. CSS VÀ JAVASCRIPT
+// ==========================================
+add_action('wp_footer', 'cysp_inject_scripts_and_styles', 100);
+function cysp_inject_scripts_and_styles() {
+    global $post;
+    if (!is_a($post, 'WP_Post') || !has_shortcode($post->post_content, 'yt_search_player')) return;
+    
+    $ajax_url = admin_url('admin-ajax.php');
+    $nonce = wp_create_nonce('cysp_search_secure_nonce');
+    ?>
+    <style>
+        #cysp-container { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 1000px; margin: auto; }
+        .cysp-search-wrapper { margin-bottom: 25px; padding: 20px; background: #fff; border: 1px solid #eee; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+        .cysp-search-bar { display: flex; gap: 10px; margin-bottom: 20px; }
+        #cysp-search-input { flex: 1; padding: 12px 15px; border: 2px solid #eee; border-radius: 8px; font-size: 16px; transition: 0.3s; }
+        #cysp-search-input:focus { border-color: #d32f2f; outline: none; }
+        #cysp-search-btn { padding: 12px 25px; cursor: pointer; background: #d32f2f; color: white; border: none; border-radius: 8px; font-weight: bold; }
+        
+        /* CSS 2 Hàng gợi ý */
+        .cysp-suggestions-container { margin-bottom: 20px; border-top: 1px solid #f5f5f5; padding-top: 15px; }
+        .cysp-row-label { font-size: 12px; font-weight: bold; color: #888; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.5px; }
+        .cysp-suggestions-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 15px; }
+        .cysp-tag { background: #f8f9fa; padding: 6px 14px; border-radius: 6px; font-size: 13px; cursor: pointer; border: 1px solid #e9ecef; transition: 0.2s; color: #495057; }
+        .cysp-tag:hover { background: #d32f2f; color: #fff; border-color: #d32f2f; }
+        .hskk-tag { background: #fff3e0; border-color: #ffe0b2; }
+        .hskk-tag:hover { background: #fb8c00; border-color: #fb8c00; }
+
+        .cysp-filters { display: flex; flex-wrap: wrap; gap: 15px; font-size: 14px; background: #fcfcfc; padding: 12px; border-radius: 8px; border: 1px solid #f0f0f0; }
+        .filter-group { display: flex; align-items: center; gap: 8px; }
+        .filter-group label { font-weight: 600; color: #555; }
+        .filter-group select { padding: 5px 10px; border-radius: 5px; border: 1px solid #ddd; }
+
+        #cysp-player-container { display: none; margin-bottom: 30px; background: #000; border-radius: 12px; overflow: hidden; }
+        .cysp-iframe-wrapper { position: relative; padding-bottom: 56.25%; height: 0; }
+        #cysp-iframe { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+
+        #cysp-loading { display: none; text-align: center; padding: 20px; font-weight: bold; color: #d32f2f; }
+        #cysp-results { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 20px; }
+        .cysp-item { cursor: pointer; transition: 0.3s; border-radius: 10px; overflow: hidden; background: #fff; border: 1px solid #eee; }
+        .cysp-item:hover { transform: translateY(-5px); box-shadow: 0 8px 20px rgba(0,0,0,0.1); }
+        .cysp-thumb-wrap { position: relative; height: 130px; }
+        .cysp-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
+        .cysp-cc-badge { position: absolute; bottom: 8px; right: 8px; background: #d32f2f; color: #fff; font-size: 10px; padding: 2px 5px; border-radius: 3px; font-weight: bold; }
+        .cysp-info { padding: 12px; }
+        .cysp-title { font-size: 14px; font-weight: 600; margin: 0 0 5px 0; line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .cysp-channel { font-size: 12px; color: #888; }
+    </style>
+
+    <script type="text/javascript">
+        jQuery(document).ready(function($) {
+            function performSearch() {
+                var query = $('#cysp-search-input').val().trim();
+                if (!query) return;
+                
+                $('#cysp-results').empty();
+                $('#cysp-loading').fadeIn();
+                
+                $.post('<?php echo $ajax_url; ?>', {
+                    action: 'cysp_search',
+                    security: '<?php echo $nonce; ?>',
+                    query: query,
+                    lang: $('#cysp-lang').val(),
+                    duration: $('#cysp-duration').val(),
+                    caption: $('#cysp-caption').val()
+                }, function(response) {
+                    $('#cysp-loading').hide();
+                    if (response.success) {
+                        $.each(response.data, function(i, item) {
+                            var html = '<div class="cysp-item" data-vid="'+item.id.videoId+'">';
+                            html += '<div class="cysp-thumb-wrap"><img src="'+item.snippet.thumbnails.medium.url+'" />';
+                            if($('#cysp-caption').val() === 'closedCaption') html += '<span class="cysp-cc-badge">CC</span>';
+                            html += '</div><div class="cysp-info">';
+                            html += '<h4 class="cysp-title">'+item.snippet.title+'</h4>';
+                            html += '<p class="cysp-channel">📺 '+item.snippet.channelTitle+'</p>';
+                            html += '</div></div>';
+                            $('#cysp-results').append(html);
+                        });
+                    }
+                });
+            }
+
+            $('#cysp-search-btn').click(performSearch);
+            $('#cysp-search-input').keypress(function(e) { if (e.which === 13) performSearch(); });
+            $('.cysp-tag').click(function() {
+                $('#cysp-search-input').val($(this).data('kw'));
+                performSearch();
+            });
+
+            $(document).on('click', '.cysp-item', function() {
+                var vidId = $(this).data('vid');
+                var lp = $('#cysp-lang').val() === 'zh-Hant' ? 'zh-TW' : 'zh-CN';
+                $('#cysp-iframe').attr('src', 'https://www.youtube.com/embed/' + vidId + '?autoplay=1&cc_load_policy=1&hl='+lp+'&cc_lang_pref='+lp);
+                $('#cysp-player-container').slideDown();
+                $('html, body').animate({ scrollTop: $("#cysp-container").offset().top - 20 }, 500);
+            });
+        });
+    </script>
+    <?php
+}
