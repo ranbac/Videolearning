@@ -1,8 +1,7 @@
-<?php
 /*
 Plugin Name: Custom YouTube Search Player (Chinese Learner Edition)
-Description: V8.0: Icon-only controls, compact Dictation & Shadowing panels, beep + animated stop button on record.
-Version: 8.0
+Description: V9.0: Custom player controls — YouTube iframe chạy ngầm, toàn bộ UI tự làm, không logo YouTube.
+Version: 9.0
 Author: Bạn (Upgraded)
 */
 
@@ -108,17 +107,17 @@ function cysp_handle_get_transcript() {
         'headers' => ['User-Agent' => 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', 'Accept-Language' => 'en-US,en;q=0.9'],
         'timeout' => 15,
     ]);
-    if (is_wp_error($page)) wp_send_json_error('Không tải được trang YouTube (Lỗi mạng server).');
+    if (is_wp_error($page)) wp_send_json_error('Không tải được trang YouTube.');
 
     $html = wp_remote_retrieve_body($page);
     preg_match('/"captionTracks":\s*(\[.*?\])/', $html, $matches);
-    if (empty($matches[1])) wp_send_json_error('Không có file local và video này cũng không có phụ đề (CC).');
+    if (empty($matches[1])) wp_send_json_error('Video này không có phụ đề (CC).');
 
     $tracks = json_decode($matches[1], true);
-    if (empty($tracks) || !is_array($tracks)) wp_send_json_error('Không thể phân tích dữ liệu phụ đề từ YouTube.');
+    if (empty($tracks) || !is_array($tracks)) wp_send_json_error('Không thể phân tích dữ liệu phụ đề.');
 
-    $lang_codes  = [$lang, 'zh', 'zh-Hans', 'zh-Hant', 'zh-CN', 'zh-TW'];
-    $chosen_url  = null;
+    $lang_codes = [$lang, 'zh', 'zh-Hans', 'zh-Hant', 'zh-CN', 'zh-TW'];
+    $chosen_url = null;
     foreach ($lang_codes as $lc) {
         foreach ($tracks as $track) {
             if (isset($track['languageCode']) && stripos($track['languageCode'], $lc) !== false) {
@@ -191,7 +190,7 @@ function cysp_handle_get_local_videos() {
     $formatted_items = [];
     if (!empty($data->items)) {
         foreach ($data->items as $item) {
-            $item->id      = (object) ['videoId' => $item->id];
+            $item->id = (object) ['videoId' => $item->id];
             $formatted_items[] = $item;
         }
     }
@@ -253,7 +252,7 @@ function cysp_handle_ajax_search() {
 }
 
 // ==========================================
-// 3. SHORTCODE HTML — V8
+// 3. SHORTCODE HTML — V9
 // ==========================================
 add_shortcode('yt_search_player', 'cysp_shortcode_html');
 function cysp_shortcode_html() {
@@ -267,11 +266,10 @@ function cysp_shortcode_html() {
         <div class="cysp-search-bar">
             <input type="text" id="cysp-search-input" placeholder="Tìm kiếm bài học (để trống &amp; Enter để xem thư viện)..." aria-label="Tìm kiếm bài học" />
             <button id="cysp-search-btn" aria-label="Tìm kiếm">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
                 Tìm kiếm
             </button>
         </div>
-
         <div class="cysp-suggestions-container">
             <div class="cysp-row-label">Cấp độ HSK</div>
             <div class="cysp-suggestions-row">
@@ -290,7 +288,6 @@ function cysp_shortcode_html() {
                 <span class="cysp-tag cysp-tag--hskk" data-kw="HSKK Cao cấp">HSKK Cao cấp</span>
             </div>
         </div>
-
         <div class="cysp-filters">
             <div class="cysp-filter-group">
                 <label for="cysp-duration">Thời lượng</label>
@@ -321,11 +318,17 @@ function cysp_shortcode_html() {
     <!-- ── PLAYER + PANELS ── -->
     <div id="cysp-player-container">
 
-        <!-- Video + Shield -->
-        <div class="cysp-video-wrap">
-            <div class="cysp-iframe-ratio">
+        <!-- ══ CUSTOM VIDEO PLAYER ══ -->
+        <div class="cysp-custom-player" id="cysp-custom-player">
+
+            <!-- YouTube iframe — ẩn sau lớp video hiển thị -->
+            <div class="cysp-yt-hidden-wrap">
                 <div id="cysp-yt-player"></div>
+                <!-- Lớp che toàn bộ iframe, ngăn mọi click vào YouTube UI -->
+                <div class="cysp-iframe-blocker" id="cysp-iframe-blocker"></div>
             </div>
+
+            <!-- Shield overlay (Dictation) -->
             <div id="cysp-shield" role="status" aria-live="polite">
                 <div class="cysp-shield-inner">
                     <div class="cysp-shield-icon" aria-hidden="true">🙈</div>
@@ -334,7 +337,69 @@ function cysp_shortcode_html() {
                     <button class="cysp-shield-btn" id="shield-reveal-btn" style="display:none;">Hiện lại video</button>
                 </div>
             </div>
-        </div>
+
+            <!-- Custom controls bar -->
+            <div class="cysp-controls" id="cysp-controls">
+
+                <!-- Progress / seek bar -->
+                <div class="cysp-progress-wrap" id="cysp-progress-wrap" role="slider" aria-label="Thanh tiến trình" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
+                    <div class="cysp-progress-bg"></div>
+                    <div class="cysp-progress-fill" id="cysp-progress-fill"></div>
+                    <div class="cysp-progress-thumb" id="cysp-progress-thumb"></div>
+                    <div class="cysp-progress-tooltip" id="cysp-progress-tooltip">0:00</div>
+                </div>
+
+                <!-- Buttons row -->
+                <div class="cysp-ctrl-bar">
+                    <div class="cysp-ctrl-left">
+                        <!-- Play/Pause -->
+                        <button class="cysp-ctrl-btn" id="cysp-playpause-btn" aria-label="Phát / Tạm dừng">
+                            <svg class="icon-play" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+                            <svg class="icon-pause" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+                        </button>
+
+                        <!-- Time -->
+                        <span class="cysp-time" id="cysp-time-display">0:00 / 0:00</span>
+                    </div>
+
+                    <div class="cysp-ctrl-right">
+                        <!-- Speed -->
+                        <div class="cysp-speed-dropdown" id="cysp-speed-dropdown">
+                            <button class="cysp-ctrl-btn cysp-speed-btn" id="cysp-speed-btn" aria-label="Tốc độ phát">
+                                <span id="cysp-speed-label">1×</span>
+                            </button>
+                            <div class="cysp-speed-menu" id="cysp-speed-menu">
+                                <button class="cysp-speed-opt" data-rate="0.5">0.5×</button>
+                                <button class="cysp-speed-opt" data-rate="0.75">0.75×</button>
+                                <button class="cysp-speed-opt cysp-speed-opt--active" data-rate="1">1×</button>
+                                <button class="cysp-speed-opt" data-rate="1.25">1.25×</button>
+                                <button class="cysp-speed-opt" data-rate="1.5">1.5×</button>
+                            </div>
+                        </div>
+
+                        <!-- Volume -->
+                        <div class="cysp-vol-wrap">
+                            <button class="cysp-ctrl-btn" id="cysp-mute-btn" aria-label="Tắt / Bật tiếng">
+                                <svg class="icon-vol" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z"/></svg>
+                                <svg class="icon-mute" width="18" height="18" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z"/></svg>
+                            </button>
+                            <div class="cysp-vol-slider-wrap">
+                                <div class="cysp-vol-bg"></div>
+                                <div class="cysp-vol-fill" id="cysp-vol-fill" style="width:100%"></div>
+                                <input type="range" class="cysp-vol-input" id="cysp-vol-input" min="0" max="100" value="100" aria-label="Âm lượng" />
+                            </div>
+                        </div>
+
+                        <!-- Fullscreen -->
+                        <button class="cysp-ctrl-btn" id="cysp-fs-btn" aria-label="Toàn màn hình">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"/></svg>
+                        </button>
+                    </div>
+                </div>
+
+            </div><!-- /.cysp-controls -->
+
+        </div><!-- /.cysp-custom-player -->
 
         <!-- Mode toolbar -->
         <div id="cysp-mode-toolbar" style="display:none;" role="tablist">
@@ -349,14 +414,12 @@ function cysp_shortcode_html() {
 
         <!-- ══ DICTATION PANEL ══ -->
         <div id="cysp-dictation-panel" class="cysp-panel" style="display:none;" role="tabpanel">
-
             <div id="dict-sentence-display" class="cysp-sentence-box" style="display:none;">
                 <span class="cysp-sentence-dot cysp-sentence-dot--red" aria-hidden="true"></span>
                 <span id="dict-sentence-text" class="cysp-sentence-text cysp-sentence-text--blur" aria-label="Câu đang luyện tập"></span>
                 <span id="dict-countdown" class="cysp-inline-countdown" aria-live="assertive"></span>
                 <span id="dict-sentence-idx" class="cysp-sentence-meta"></span>
             </div>
-
             <div class="cysp-ctrl-row">
                 <div class="cysp-ctrl-col">
                     <button class="cysp-ibtn cysp-ibtn--ghost" id="dict-prev-btn" aria-label="Câu trước">
@@ -377,29 +440,23 @@ function cysp_shortcode_html() {
                     <span class="cysp-ctrl-lbl">Tiếp</span>
                 </div>
             </div>
-
             <div class="cysp-input-area">
                 <textarea id="dict-input" placeholder="Gõ những gì bạn nghe được..." rows="3" disabled aria-label="Nhập câu bạn nghe được"></textarea>
                 <button id="dict-check-btn" class="cysp-check-btn" disabled aria-label="Kiểm tra và hiện video">
                     Kiểm tra<br><small>+ hiện video</small>
                 </button>
             </div>
-
             <div id="dict-result" class="cysp-result-box" style="display:none;" role="alert"></div>
-
         </div>
 
         <!-- ══ SHADOWING PANEL ══ -->
         <div id="cysp-shadowing-panel" class="cysp-panel" style="display:none;" role="tabpanel">
-
             <div id="shadow-sentence-display" class="cysp-sentence-box" style="display:none;">
                 <span class="cysp-sentence-dot cysp-sentence-dot--green" aria-hidden="true"></span>
                 <span id="shadow-sentence-text" class="cysp-sentence-text" aria-label="Câu đang luyện phát âm"></span>
                 <span id="shadow-countdown" class="cysp-inline-countdown" aria-live="assertive"></span>
                 <span id="shadow-sentence-idx" class="cysp-sentence-meta"></span>
             </div>
-
-            <!-- Controls: idle -->
             <div class="cysp-ctrl-row" id="shadow-ctrl-idle">
                 <div class="cysp-ctrl-col">
                     <button class="cysp-ibtn cysp-ibtn--ghost" id="shadow-prev-btn" aria-label="Câu trước">
@@ -420,13 +477,9 @@ function cysp_shortcode_html() {
                     <span class="cysp-ctrl-lbl">Tiếp</span>
                 </div>
             </div>
-
-            <!-- Controls: recording — Stop thay thế Play -->
             <div class="cysp-ctrl-row" id="shadow-ctrl-rec" style="display:none;">
                 <div class="cysp-ctrl-col">
-                    <button class="cysp-ibtn cysp-ibtn--ghost" disabled aria-label="Câu trước">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
-                    </button>
+                    <button class="cysp-ibtn cysp-ibtn--ghost" disabled><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg></button>
                     <span class="cysp-ctrl-lbl">Trước</span>
                 </div>
                 <div class="cysp-ctrl-col">
@@ -436,13 +489,10 @@ function cysp_shortcode_html() {
                     <span class="cysp-ctrl-lbl cysp-ctrl-lbl--stop">Dừng</span>
                 </div>
                 <div class="cysp-ctrl-col">
-                    <button class="cysp-ibtn cysp-ibtn--ghost" disabled aria-label="Câu tiếp">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-                    </button>
+                    <button class="cysp-ibtn cysp-ibtn--ghost" disabled><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></button>
                     <span class="cysp-ctrl-lbl">Tiếp</span>
                 </div>
             </div>
-
             <div class="cysp-speed-row">
                 <span class="cysp-speed-label">Tốc độ</span>
                 <div class="cysp-speed-pills" role="group" aria-label="Chọn tốc độ phát">
@@ -452,10 +502,7 @@ function cysp_shortcode_html() {
                     <button class="cysp-speed-pill" data-rate="1.25" aria-pressed="false">1.25×</button>
                 </div>
             </div>
-
             <div class="cysp-rec-area">
-
-                <!-- Đang ghi -->
                 <div id="shadow-rec-live" style="display:none;">
                     <div class="cysp-rec-header">
                         <span class="cysp-rec-label">Đang ghi âm</span>
@@ -465,12 +512,10 @@ function cysp_shortcode_html() {
                         <canvas id="shadow-canvas" height="52" aria-hidden="true"></canvas>
                     </div>
                 </div>
-
-                <!-- Idle / sau ghi -->
                 <div id="shadow-rec-idle">
                     <div class="cysp-rec-header">
                         <span class="cysp-rec-label" id="shadow-idle-label">Nhấn Phát để bắt đầu</span>
-                        <button class="cysp-btn cysp-btn--ghost" id="shadow-clear-rec-btn" style="display:none;font-size:12px;padding:4px 10px;" aria-label="Xóa bản ghi">Xóa</button>
+                        <button class="cysp-btn cysp-btn--ghost" id="shadow-clear-rec-btn" style="display:none;font-size:12px;padding:4px 10px;">Xóa</button>
                     </div>
                     <div id="shadow-playback-row" style="display:none;align-items:center;gap:10px;">
                         <button class="cysp-play-rec-btn" id="shadow-listen-btn" aria-label="Nghe lại bản ghi">
@@ -479,11 +524,8 @@ function cysp_shortcode_html() {
                         <audio id="shadow-audio" controls style="flex:1;height:32px;"></audio>
                     </div>
                 </div>
-
             </div>
-
             <div id="shadow-result" class="cysp-result-box" style="display:none;" role="alert"></div>
-
         </div>
 
     </div><!-- /#cysp-player-container -->
@@ -522,16 +564,15 @@ function cysp_inject_scripts_and_styles() {
 
 <style>
 /* ============================================================
-   CYSP V8 — Design tokens
+   CYSP V9 — Design tokens
    ============================================================ */
 #cysp-container {
     --c-primary:        #d32f2f;
     --c-primary-dark:   #b71c1c;
     --c-success:        #0F6E56;
-    --c-success-light:  #E1F5EE;
-    --c-success-text:   #04342C;
     --c-surface:        #1a1a2e;
     --c-surface-deep:   #0f0f1a;
+    --c-surface-mid:    #141428;
     --c-danger:         #c62828;
     --c-warning-bg:     #FAEEDA;
     --c-warning-border: #EF9F27;
@@ -550,116 +591,75 @@ function cysp_inject_scripts_and_styles() {
 }
 
 /* ── Search wrapper ── */
-.cysp-search-wrapper {
-    margin-bottom: 24px;
-    padding: 20px;
-    background: #fff;
-    border: 0.5px solid #e5e5e5;
-    border-radius: var(--radius-lg);
-}
-.cysp-search-bar {
-    display: flex;
-    gap: 10px;
-    margin-bottom: 18px;
-}
-#cysp-search-input {
-    flex: 1;
-    padding: 11px 14px;
-    border: 1.5px solid #e5e5e5;
-    border-radius: var(--radius);
-    font-size: 15px;
-    font-family: inherit;
-    transition: border-color .2s;
-    outline: none;
-}
+.cysp-search-wrapper { margin-bottom: 24px; padding: 20px; background: #fff; border: 0.5px solid #e5e5e5; border-radius: var(--radius-lg); }
+.cysp-search-bar { display: flex; gap: 10px; margin-bottom: 18px; }
+#cysp-search-input { flex: 1; padding: 11px 14px; border: 1.5px solid #e5e5e5; border-radius: var(--radius); font-size: 15px; font-family: inherit; transition: border-color .2s; outline: none; }
 #cysp-search-input:focus { border-color: var(--c-primary); box-shadow: 0 0 0 3px rgba(211,47,47,.08); }
-#cysp-search-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    padding: 11px 22px;
-    background: var(--c-primary);
-    color: #fff;
-    border: none;
-    border-radius: var(--radius);
-    font-size: 14px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background .2s;
-    white-space: nowrap;
-}
+#cysp-search-btn { display: inline-flex; align-items: center; gap: 7px; padding: 11px 22px; background: var(--c-primary); color: #fff; border: none; border-radius: var(--radius); font-size: 14px; font-weight: 500; cursor: pointer; transition: background .2s; white-space: nowrap; }
 #cysp-search-btn:hover { background: var(--c-primary-dark); }
-
-/* ── Tag suggestions ── */
-.cysp-suggestions-container {
-    padding-top: 16px;
-    border-top: 0.5px solid #f0f0f0;
-    margin-bottom: 16px;
-}
-.cysp-row-label {
-    font-size: 11px;
-    font-weight: 500;
-    color: #999;
-    text-transform: uppercase;
-    letter-spacing: .6px;
-    margin-bottom: 8px;
-}
-.cysp-suggestions-row {
-    display: flex;
-    gap: 7px;
-    flex-wrap: wrap;
-    margin-bottom: 14px;
-}
-.cysp-tag {
-    padding: 5px 13px;
-    background: #f5f5f5;
-    border: 0.5px solid #e0e0e0;
-    border-radius: 20px;
-    font-size: 13px;
-    cursor: pointer;
-    color: #444;
-    transition: background .15s, color .15s, border-color .15s;
-    user-select: none;
-}
-.cysp-tag:hover       { background: var(--c-primary); color: #fff; border-color: var(--c-primary); }
-.cysp-tag--hskk       { background: #FFF3E0; border-color: #FFCC80; color: #6D4C1A; }
+.cysp-suggestions-container { padding-top: 16px; border-top: 0.5px solid #f0f0f0; margin-bottom: 16px; }
+.cysp-row-label { font-size: 11px; font-weight: 500; color: #999; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 8px; }
+.cysp-suggestions-row { display: flex; gap: 7px; flex-wrap: wrap; margin-bottom: 14px; }
+.cysp-tag { padding: 5px 13px; background: #f5f5f5; border: 0.5px solid #e0e0e0; border-radius: 20px; font-size: 13px; cursor: pointer; color: #444; transition: background .15s, color .15s, border-color .15s; user-select: none; }
+.cysp-tag:hover { background: var(--c-primary); color: #fff; border-color: var(--c-primary); }
+.cysp-tag--hskk { background: #FFF3E0; border-color: #FFCC80; color: #6D4C1A; }
 .cysp-tag--hskk:hover { background: #E65100; color: #fff; border-color: #E65100; }
-
-/* ── Filters ── */
-.cysp-filters {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    padding: 12px;
-    background: #fafafa;
-    border: 0.5px solid #f0f0f0;
-    border-radius: var(--radius);
-}
+.cysp-filters { display: flex; flex-wrap: wrap; gap: 12px; padding: 12px; background: #fafafa; border: 0.5px solid #f0f0f0; border-radius: var(--radius); }
 .cysp-filter-group { display: flex; align-items: center; gap: 7px; }
 .cysp-filter-group label { font-size: 12px; font-weight: 500; color: #666; white-space: nowrap; }
 .cysp-filter-group select { padding: 5px 9px; border: 0.5px solid #d5d5d5; border-radius: 6px; font-size: 13px; font-family: inherit; background: #fff; color: #333; cursor: pointer; }
 
 /* ── Player container ── */
-#cysp-player-container {
-    display: none;
-    margin-bottom: 30px;
-    border-radius: var(--radius-lg);
+#cysp-player-container { display: none; margin-bottom: 30px; border-radius: var(--radius-lg); overflow: hidden; border: 0.5px solid #2a2a3e; }
+
+/* ══════════════════════════════════════════
+   CUSTOM PLAYER
+══════════════════════════════════════════ */
+.cysp-custom-player {
+    position: relative;
+    background: #000;
+    width: 100%;
+    aspect-ratio: 16 / 9;
     overflow: hidden;
-    border: 0.5px solid #2a2a3e;
+    /* Khi fullscreen thì aspect-ratio tự reset */
+}
+.cysp-custom-player:-webkit-full-screen { aspect-ratio: unset; width: 100vw; height: 100vh; }
+.cysp-custom-player:-moz-full-screen    { aspect-ratio: unset; width: 100vw; height: 100vh; }
+.cysp-custom-player:fullscreen          { aspect-ratio: unset; width: 100vw; height: 100vh; }
+
+/* YouTube iframe — chiếm toàn bộ player, ẩn sau blocker */
+.cysp-yt-hidden-wrap {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+}
+.cysp-yt-hidden-wrap iframe,
+#cysp-yt-player {
+    position: absolute;
+    /* Phóng to hơn container để cắt hết thanh trên/dưới của YouTube */
+    top: -60px;
+    left: -10px;
+    width: calc(100% + 20px);
+    height: calc(100% + 120px);
+    border: none;
+    pointer-events: none; /* Không cho click vào iframe */
 }
 
-/* ── Video area ── */
-.cysp-video-wrap { position: relative; background: var(--c-surface-deep); }
-.cysp-iframe-ratio { position: relative; padding-bottom: 56.25%; height: 0; background: #000; }
-#cysp-yt-player,
-.cysp-iframe-ratio iframe { position: absolute; inset: 0; width: 100%; height: 100%; }
+/* Lớp trong suốt che toàn bộ iframe — khoá mọi tương tác với YT UI */
+.cysp-iframe-blocker {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    background: transparent;
+    cursor: default;
+}
 
 /* ── Shield overlay ── */
 #cysp-shield {
     display: none;
     position: absolute;
     inset: 0;
-    z-index: 10;
+    z-index: 20;
     background: var(--c-surface-deep);
     align-items: center;
     justify-content: center;
@@ -668,10 +668,162 @@ function cysp_inject_scripts_and_styles() {
 .cysp-shield-inner   { text-align: center; color: #fff; padding: 24px; }
 .cysp-shield-icon    { font-size: 52px; margin-bottom: 14px; animation: cysp-float 3s ease-in-out infinite; }
 @keyframes cysp-float { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-10px)} }
-.cysp-shield-msg { font-size: 15px; color: #9aa3b8; line-height: 1.7; margin: 0 0 16px; }
+.cysp-shield-msg     { font-size: 15px; color: #9aa3b8; line-height: 1.7; margin: 0 0 16px; }
 .cysp-shield-countdown { font-size: 44px; font-weight: 500; color: var(--c-primary); letter-spacing: 2px; min-height: 54px; font-variant-numeric: tabular-nums; }
 .cysp-shield-btn { margin-top: 18px; padding: 11px 30px; background: var(--c-primary); color: #fff; border: none; border-radius: 50px; font-size: 15px; font-weight: 500; cursor: pointer; transition: background .2s, transform .15s; }
 .cysp-shield-btn:hover { background: var(--c-primary-dark); transform: scale(1.03); }
+
+/* ── Custom controls bar ── */
+.cysp-controls {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 30;
+    background: linear-gradient(transparent, rgba(0,0,0,.82) 60%);
+    padding: 32px 14px 10px;
+    opacity: 0;
+    transform: translateY(6px);
+    transition: opacity .25s, transform .25s;
+}
+.cysp-custom-player:hover .cysp-controls,
+.cysp-custom-player.cysp-controls-visible .cysp-controls {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+/* ── Progress bar ── */
+.cysp-progress-wrap {
+    position: relative;
+    height: 18px;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    margin-bottom: 6px;
+}
+.cysp-progress-bg, .cysp-progress-fill {
+    position: absolute;
+    left: 0; top: 50%;
+    transform: translateY(-50%);
+    height: 3px;
+    border-radius: 3px;
+    pointer-events: none;
+    transition: height .15s;
+}
+.cysp-progress-bg   { width: 100%; background: rgba(255,255,255,.2); }
+.cysp-progress-fill { width: 0%; background: var(--c-primary); }
+.cysp-progress-wrap:hover .cysp-progress-bg,
+.cysp-progress-wrap:hover .cysp-progress-fill { height: 5px; }
+.cysp-progress-thumb {
+    position: absolute;
+    top: 50%;
+    transform: translate(-50%, -50%) scale(0);
+    width: 14px; height: 14px;
+    border-radius: 50%;
+    background: #fff;
+    pointer-events: none;
+    transition: transform .15s;
+    box-shadow: 0 1px 4px rgba(0,0,0,.4);
+}
+.cysp-progress-wrap:hover .cysp-progress-thumb { transform: translate(-50%, -50%) scale(1); }
+.cysp-progress-tooltip {
+    position: absolute;
+    bottom: 22px;
+    background: rgba(0,0,0,.8);
+    color: #fff;
+    font-size: 11px;
+    padding: 3px 7px;
+    border-radius: 4px;
+    pointer-events: none;
+    display: none;
+    white-space: nowrap;
+    transform: translateX(-50%);
+}
+.cysp-progress-wrap:hover .cysp-progress-tooltip { display: block; }
+
+/* ── Control bar buttons ── */
+.cysp-ctrl-bar { display: flex; align-items: center; justify-content: space-between; }
+.cysp-ctrl-left, .cysp-ctrl-right { display: flex; align-items: center; gap: 4px; }
+.cysp-ctrl-btn {
+    background: transparent;
+    border: none;
+    color: rgba(255,255,255,.85);
+    cursor: pointer;
+    padding: 6px 8px;
+    border-radius: 6px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background .15s, color .15s;
+    font-size: 13px;
+    font-weight: 500;
+    font-family: inherit;
+    line-height: 1;
+}
+.cysp-ctrl-btn:hover { background: rgba(255,255,255,.15); color: #fff; }
+.cysp-time { font-size: 12px; color: rgba(255,255,255,.7); font-variant-numeric: tabular-nums; padding: 0 4px; white-space: nowrap; }
+
+/* ── Speed dropdown ── */
+.cysp-speed-dropdown { position: relative; }
+.cysp-speed-menu {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    right: 0;
+    background: rgba(15,15,26,.95);
+    border: 0.5px solid rgba(255,255,255,.1);
+    border-radius: var(--radius);
+    padding: 4px 0;
+    min-width: 80px;
+    display: none;
+    backdrop-filter: blur(8px);
+}
+.cysp-speed-dropdown.open .cysp-speed-menu { display: block; }
+.cysp-speed-opt {
+    display: block;
+    width: 100%;
+    padding: 7px 14px;
+    background: transparent;
+    border: none;
+    color: rgba(255,255,255,.7);
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+    text-align: left;
+    transition: background .1s, color .1s;
+}
+.cysp-speed-opt:hover        { background: rgba(255,255,255,.1); color: #fff; }
+.cysp-speed-opt--active      { color: var(--c-primary); font-weight: 600; }
+
+/* ── Volume slider ── */
+.cysp-vol-wrap { display: flex; align-items: center; gap: 4px; }
+.cysp-vol-slider-wrap {
+    position: relative;
+    width: 60px;
+    height: 18px;
+    display: flex;
+    align-items: center;
+}
+.cysp-vol-bg, .cysp-vol-fill {
+    position: absolute;
+    left: 0; top: 50%;
+    height: 3px;
+    transform: translateY(-50%);
+    border-radius: 3px;
+    pointer-events: none;
+}
+.cysp-vol-bg   { width: 100%; background: rgba(255,255,255,.2); }
+.cysp-vol-fill { background: #fff; }
+.cysp-vol-input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    opacity: 0;
+    cursor: pointer;
+    margin: 0;
+}
+
+/* ── Shield overlay ── */
+#cysp-shield { z-index: 25; } /* above iframe-blocker (2) + controls (30) — actually controls are below shield */
 
 /* ── Mode toolbar ── */
 #cysp-mode-toolbar { display: flex; background: var(--c-surface); }
@@ -684,15 +836,7 @@ function cysp_inject_scripts_and_styles() {
 .cysp-state-error   { padding: 13px 16px; font-size: 14px; background: var(--c-wrong-bg); color: var(--c-wrong-text); border: 0.5px solid var(--c-wrong-border); border-top: none; border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
 
 /* ── Practice panels ── */
-.cysp-panel {
-    background: #fff;
-    padding: 14px 16px;
-    border: 0.5px solid #e5e5e5;
-    border-top: none;
-    border-radius: 0 0 var(--radius-lg) var(--radius-lg);
-}
-
-/* ── Sentence box ── */
+.cysp-panel { background: #fff; padding: 14px 16px; border: 0.5px solid #e5e5e5; border-top: none; border-radius: 0 0 var(--radius-lg) var(--radius-lg); }
 .cysp-sentence-box { display: flex; align-items: center; gap: 10px; background: #fafafa; border: 0.5px solid #e5e5e5; border-radius: var(--radius); padding: 10px 14px; margin-bottom: 14px; }
 .cysp-sentence-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
 .cysp-sentence-dot--red   { background: var(--c-primary); }
@@ -701,137 +845,42 @@ function cysp_inject_scripts_and_styles() {
 .cysp-sentence-text--blur { filter: blur(5px); transition: filter .35s; user-select: none; }
 .cysp-sentence-text--blur.revealed { filter: none; }
 .cysp-sentence-meta { font-size: 11px; color: #aaa; white-space: nowrap; flex-shrink: 0; }
+.cysp-inline-countdown { font-size: 12px; font-weight: 500; color: var(--c-primary); font-variant-numeric: tabular-nums; min-width: 22px; flex-shrink: 0; }
 
-/* ── Inline countdown ── */
-.cysp-inline-countdown {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--c-primary);
-    font-variant-numeric: tabular-nums;
-    min-width: 22px;
-    flex-shrink: 0;
-}
-
-/* ── Icon buttons ── */
-.cysp-ibtn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 44px;
-    height: 44px;
-    border-radius: 10px;
-    border: none;
-    cursor: pointer;
-    transition: opacity .15s, transform .1s;
-    flex-shrink: 0;
-}
-.cysp-ibtn:active            { transform: scale(.93); }
-.cysp-ibtn:disabled          { opacity: .3; cursor: not-allowed; }
-
-.cysp-ibtn--ghost            { background: #1a1a2e; }
+/* ── Icon buttons (panel) ── */
+.cysp-ibtn { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px; border-radius: 10px; border: none; cursor: pointer; transition: opacity .15s, transform .1s; flex-shrink: 0; }
+.cysp-ibtn:active { transform: scale(.93); }
+.cysp-ibtn:disabled { opacity: .3; cursor: not-allowed; }
+.cysp-ibtn--ghost { background: #1a1a2e; }
 .cysp-ibtn--ghost:hover:not(:disabled) { background: #2a2a3e; }
-.cysp-ibtn--ghost svg        { stroke: #fff; fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
-
-.cysp-ibtn--red              { background: var(--c-primary); }
+.cysp-ibtn--ghost svg { stroke: #fff; fill: none; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.cysp-ibtn--red { background: var(--c-primary); }
 .cysp-ibtn--red:hover:not(:disabled) { background: var(--c-primary-dark); }
-.cysp-ibtn--red svg          { fill: #fff; }
-
-.cysp-ibtn--green            { background: var(--c-success); }
+.cysp-ibtn--red svg { fill: #fff; }
+.cysp-ibtn--green { background: var(--c-success); }
 .cysp-ibtn--green:hover:not(:disabled) { background: #085041; }
-.cysp-ibtn--green svg        { fill: #fff; }
+.cysp-ibtn--green svg { fill: #fff; }
+.cysp-ibtn--stop { background: var(--c-primary); animation: cysp-blink-stop 1s ease-in-out infinite; }
+.cysp-ibtn--stop svg { fill: #fff; }
+@keyframes cysp-blink-stop { 0%,100%{opacity:1} 50%{opacity:.4} }
+.cysp-ctrl-col { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+.cysp-ctrl-lbl { font-size: 10px; color: #999; white-space: nowrap; }
+.cysp-ctrl-lbl--stop { color: var(--c-primary); font-weight: 500; }
+.cysp-ctrl-row { display: flex; gap: 8px; margin-bottom: 14px; }
 
-.cysp-ibtn--stop {
-    background: var(--c-primary);
-    animation: cysp-blink-stop 1s ease-in-out infinite;
-}
-.cysp-ibtn--stop svg         { fill: #fff; }
-
-@keyframes cysp-blink-stop {
-    0%, 100% { opacity: 1; }
-    50%       { opacity: .4; }
-}
-
-/* ── Ctrl col + label ── */
-.cysp-ctrl-col {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 4px;
-}
-.cysp-ctrl-lbl {
-    font-size: 10px;
-    color: #999;
-    white-space: nowrap;
-}
-.cysp-ctrl-lbl--stop {
-    color: var(--c-primary);
-    font-weight: 500;
-}
-
-/* ── Ctrl row ── */
-.cysp-ctrl-row {
-    display: flex;
-    gap: 8px;
-    margin-bottom: 14px;
-}
-
-/* ── Ghost btn (utility) ── */
-.cysp-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 7px 14px;
-    border-radius: var(--radius);
-    border: 0.5px solid #d0d0d0;
-    background: transparent;
-    color: #555;
-    font-size: 13px;
-    font-weight: 500;
-    font-family: inherit;
-    cursor: pointer;
-    transition: background .15s;
-}
+.cysp-btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px; border-radius: var(--radius); border: 0.5px solid #d0d0d0; background: transparent; color: #555; font-size: 13px; font-weight: 500; font-family: inherit; cursor: pointer; transition: background .15s; }
 .cysp-btn--ghost:hover:not(:disabled) { background: #f5f5f5; }
 .cysp-btn:disabled { opacity: .38; cursor: not-allowed; }
 
-/* ── Input area ── */
 .cysp-input-area { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 14px; }
-#dict-input {
-    flex: 1;
-    padding: 11px 13px;
-    border: 1.5px solid #e0e0e0;
-    border-radius: var(--radius);
-    font-size: 15px;
-    font-family: "Noto Sans SC", inherit;
-    line-height: 1.7;
-    resize: vertical;
-    transition: border-color .2s;
-    outline: none;
-    min-height: 80px;
-}
-#dict-input:focus    { border-color: var(--c-primary); box-shadow: 0 0 0 3px rgba(211,47,47,.08); }
+#dict-input { flex: 1; padding: 11px 13px; border: 1.5px solid #e0e0e0; border-radius: var(--radius); font-size: 15px; font-family: "Noto Sans SC", inherit; line-height: 1.7; resize: vertical; transition: border-color .2s; outline: none; min-height: 80px; }
+#dict-input:focus { border-color: var(--c-primary); box-shadow: 0 0 0 3px rgba(211,47,47,.08); }
 #dict-input:disabled { background: #f5f5f5; cursor: not-allowed; }
-.cysp-check-btn {
-    padding: 10px 16px;
-    background: #27500A;
-    color: #C0DD97;
-    border: none;
-    border-radius: var(--radius);
-    font-size: 13px;
-    font-weight: 500;
-    font-family: inherit;
-    cursor: pointer;
-    white-space: nowrap;
-    text-align: center;
-    line-height: 1.5;
-    transition: background .15s;
-    flex-shrink: 0;
-}
+.cysp-check-btn { padding: 10px 16px; background: #27500A; color: #C0DD97; border: none; border-radius: var(--radius); font-size: 13px; font-weight: 500; font-family: inherit; cursor: pointer; white-space: nowrap; text-align: center; line-height: 1.5; transition: background .15s; flex-shrink: 0; }
 .cysp-check-btn small { font-weight: 400; opacity: .8; display: block; font-size: 11px; }
 .cysp-check-btn:hover:not(:disabled) { background: #173404; }
 .cysp-check-btn:disabled { opacity: .38; cursor: not-allowed; }
 
-/* ── Result box ── */
 .cysp-result-box { padding: 13px 15px; border-radius: var(--radius); border: 0.5px solid #e0e0e0; margin-bottom: 14px; font-size: 13px; line-height: 2; }
 .cysp-result-box.correct { background: var(--c-correct-bg); border-color: var(--c-correct-border); }
 .cysp-result-box.partial  { background: var(--c-warning-bg); border-color: var(--c-warning-border); }
@@ -843,39 +892,20 @@ function cysp_inject_scripts_and_styles() {
 .cysp-char-ok  { color: #27500A; font-weight: 500; }
 .cysp-char-err { color: #791F1F; background: #F7C1C1; border-radius: 2px; padding: 0 1px; }
 
-/* ── Speed pills ── */
 .cysp-speed-row { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
 .cysp-speed-label { font-size: 12px; color: #666; }
 .cysp-speed-pills { display: flex; gap: 5px; }
 .cysp-speed-pill { padding: 4px 12px; border-radius: 20px; border: 0.5px solid #d0d0d0; background: #fff; font-size: 12px; font-weight: 500; color: #555; cursor: pointer; transition: background .15s, color .15s, border-color .15s; font-family: inherit; }
 .cysp-speed-pill:hover { border-color: var(--c-primary); color: var(--c-primary); }
-.cysp-speed-pill--active,
-.cysp-speed-pill[aria-pressed="true"] { background: var(--c-primary); border-color: var(--c-primary); color: #fff; }
+.cysp-speed-pill--active, .cysp-speed-pill[aria-pressed="true"] { background: var(--c-primary); border-color: var(--c-primary); color: #fff; }
 
-/* ── Record area ── */
 .cysp-rec-area { background: #f5f5f5; border-radius: var(--radius); padding: 12px 14px; margin-bottom: 14px; }
 .cysp-rec-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; }
 .cysp-rec-label { font-size: 13px; font-weight: 500; color: #333; }
-
-/* ── Waveform ── */
 .cysp-waveform { background: var(--c-surface-deep); border-radius: var(--radius); padding: 6px 10px; display: flex; align-items: center; gap: 8px; }
 #shadow-canvas { flex: 1; width: 100%; display: block; }
 .cysp-wave-timer { font-size: 12px; color: rgba(255,255,255,.5); font-family: monospace; min-width: 36px; flex-shrink: 0; }
-
-/* ── Playback button ── */
-.cysp-play-rec-btn {
-    width: 38px;
-    height: 38px;
-    border-radius: 50%;
-    background: var(--c-success);
-    border: none;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    flex-shrink: 0;
-    transition: background .15s;
-}
+.cysp-play-rec-btn { width: 38px; height: 38px; border-radius: 50%; background: var(--c-success); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: background .15s; }
 .cysp-play-rec-btn:hover { background: #085041; }
 .cysp-play-rec-btn svg { fill: #fff; margin-left: 2px; }
 
@@ -883,8 +913,6 @@ function cysp_inject_scripts_and_styles() {
 #cysp-results { margin-top: 8px; }
 .cysp-section-title { font-size: 16px; font-weight: 500; color: #1a1a2e; margin: 24px 0 14px; padding-bottom: 8px; border-bottom: 0.5px solid #e5e5e5; }
 .cysp-results-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; margin-bottom: 28px; }
-
-/* ── Video card ── */
 .cysp-item { cursor: pointer; border-radius: var(--radius-lg); overflow: hidden; background: #fff; border: 0.5px solid #e5e5e5; transition: transform .2s, box-shadow .2s; }
 .cysp-item:hover { transform: translateY(-4px); box-shadow: 0 8px 24px rgba(0,0,0,.1); }
 .cysp-thumb-wrap { position: relative; aspect-ratio: 16/9; overflow: hidden; background: #111; }
@@ -901,7 +929,6 @@ function cysp_inject_scripts_and_styles() {
 .cysp-card-channel { font-size: 12px; color: #999; display: flex; align-items: center; gap: 5px; }
 .cysp-card-channel svg { width: 11px; height: 11px; flex-shrink: 0; }
 
-/* ── Skeleton loader ── */
 .cysp-skeleton-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; padding: 4px 0 28px; }
 .cysp-skeleton-card { border-radius: var(--radius-lg); overflow: hidden; border: 0.5px solid #e5e5e5; background: #fff; padding-bottom: 12px; }
 .cysp-skel { background: #ececec; border-radius: 4px; animation: cysp-shimmer 1.5s ease-in-out infinite; }
@@ -910,7 +937,6 @@ function cysp_inject_scripts_and_styles() {
 .cysp-skel--title  { height: 14px; margin: 0 12px 7px; border-radius: 3px; }
 .cysp-skel--sub    { height: 11px; margin: 0 12px; width: 60%; border-radius: 3px; }
 
-/* ── Mobile ── */
 @media (max-width: 600px) {
     .cysp-search-wrapper { padding: 14px; }
     .cysp-filters { gap: 8px; }
@@ -923,8 +949,8 @@ function cysp_inject_scripts_and_styles() {
     .cysp-rec-header { flex-direction: column; align-items: flex-start; gap: 6px; }
     .cysp-speed-row { flex-wrap: wrap; }
     .cysp-panel { padding: 12px 12px; }
-    .cysp-results-grid,
-    .cysp-skeleton-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+    .cysp-results-grid, .cysp-skeleton-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
+    .cysp-vol-slider-wrap { display: none; } /* ẩn thanh âm lượng trên mobile */
 }
 </style>
 
@@ -942,7 +968,58 @@ var cyspCurrentLp        = 'zh-CN';
 var cyspRevealOnPlay     = false;
 var cyspAutoPlay         = false;
 
+/* ── Custom player state ── */
+var cyspDuration      = 0;
+var cyspProgressRAF   = null;
+var cyspIsSeeking     = false;
+var cyspControlsTimer = null;
+
 function onYouTubeIframeAPIReady() { }
+
+/* ── Format seconds → m:ss ── */
+function cyspFmtTime(s) {
+    if (isNaN(s) || s < 0) return '0:00';
+    s = Math.floor(s);
+    var m = Math.floor(s / 60), ss = s % 60;
+    return m + ':' + (ss < 10 ? '0' : '') + ss;
+}
+
+/* ── Update progress bar ── */
+function cyspUpdateProgress() {
+    if (!cyspPlayer || cyspIsSeeking) return;
+    try {
+        var cur = cyspPlayer.getCurrentTime() || 0;
+        var dur = cyspPlayer.getDuration()    || 0;
+        if (dur > 0) {
+            var pct = cur / dur * 100;
+            document.getElementById('cysp-progress-fill').style.width  = pct + '%';
+            document.getElementById('cysp-progress-thumb').style.left  = pct + '%';
+            document.getElementById('cysp-progress-wrap').setAttribute('aria-valuenow', Math.round(pct));
+        }
+        document.getElementById('cysp-time-display').textContent =
+            cyspFmtTime(cur) + ' / ' + cyspFmtTime(dur);
+    } catch(e) {}
+}
+
+function cyspStartProgressLoop() {
+    cyspUpdateProgress();
+    cyspProgressRAF = requestAnimationFrame(cyspStartProgressLoop);
+}
+function cyspStopProgressLoop() {
+    if (cyspProgressRAF) { cancelAnimationFrame(cyspProgressRAF); cyspProgressRAF = null; }
+}
+
+/* ── Show/hide controls on mouse activity ── */
+function cyspResetControlsTimer() {
+    var p = document.getElementById('cysp-custom-player');
+    p.classList.add('cysp-controls-visible');
+    clearTimeout(cyspControlsTimer);
+    cyspControlsTimer = setTimeout(function() {
+        if (cyspPlayer && cyspPlayer.getPlayerState && cyspPlayer.getPlayerState() === 1) {
+            p.classList.remove('cysp-controls-visible');
+        }
+    }, 2800);
+}
 
 function cyspInitPlayer(videoId, langPref) {
     if (typeof YT === 'undefined' || typeof YT.Player === 'undefined') {
@@ -951,15 +1028,56 @@ function cyspInitPlayer(videoId, langPref) {
     }
     cyspCurrentVid = videoId;
     cyspCurrentLp  = langPref;
-    if (cyspPlayer) { cyspPlayer.loadVideoById(videoId); return true; }
+
+    if (cyspPlayer) {
+        cyspPlayer.loadVideoById(videoId);
+        return true;
+    }
+
     cyspPlayer = new YT.Player('cysp-yt-player', {
         videoId: videoId,
-        playerVars: { autoplay: 1, cc_load_policy: 1, hl: langPref, cc_lang_pref: langPref, rel: 0, modestbranding: 1 },
+        host: 'https://www.youtube-nocookie.com',
+        playerVars: {
+            autoplay:       1,
+            cc_load_policy: 1,
+            hl:             langPref,
+            cc_lang_pref:   langPref,
+            rel:            0,
+            modestbranding: 1,
+            iv_load_policy: 3,
+            disablekb:      1,
+            fs:             0,
+            playsinline:    1,
+            controls:       0,   /* ← Tắt toàn bộ controls YouTube */
+            showinfo:       0,
+        },
         events: {
-            onReady: function(e) { e.target.playVideo(); },
+            onReady: function(e) {
+                e.target.playVideo();
+                cyspStartProgressLoop();
+                /* Sync volume slider */
+                try {
+                    var v = e.target.getVolume();
+                    document.getElementById('cysp-vol-input').value = v;
+                    document.getElementById('cysp-vol-fill').style.width = v + '%';
+                } catch(err) {}
+            },
             onStateChange: function(e) {
-                if (e.data === YT.PlayerState.PLAYING && cyspRevealOnPlay) { cyspRevealOnPlay = false; cyspHideShield(); }
-                if (e.data === YT.PlayerState.ENDED)                       { cyspRevealOnPlay = false; cyspHideShield(); }
+                var pp   = document.getElementById('cysp-playpause-btn');
+                var play = pp.querySelector('.icon-play');
+                var paus = pp.querySelector('.icon-pause');
+                if (e.data === YT.PlayerState.PLAYING) {
+                    play.style.display = 'none';
+                    paus.style.display = '';
+                    cyspStartProgressLoop();
+                    if (cyspRevealOnPlay) { cyspRevealOnPlay = false; cyspHideShield(); }
+                } else {
+                    play.style.display = '';
+                    paus.style.display = 'none';
+                    if (e.data !== YT.PlayerState.BUFFERING) cyspStopProgressLoop();
+                }
+                if (e.data === YT.PlayerState.ENDED) { cyspRevealOnPlay = false; cyspHideShield(); }
+                cyspResetControlsTimer();
             }
         }
     });
@@ -984,25 +1102,150 @@ function cyspRevealAndReplay() {
     cyspPlayer.playVideo();
 }
 
-/* ── Beep on record start ── */
 function cyspBeep() {
     try {
         var ctx  = new (window.AudioContext || window.webkitAudioContext)();
         var osc  = ctx.createOscillator();
         var gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
+        osc.connect(gain); gain.connect(ctx.destination);
         osc.frequency.value = 880;
         gain.gain.setValueAtTime(0.3, ctx.currentTime);
         gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
-        osc.start(ctx.currentTime);
-        osc.stop(ctx.currentTime + 0.18);
+        osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.18);
     } catch(e) {}
 }
 
 jQuery(document).ready(function($) {
 
-    /* ── Build video card ── */
+    /* ══ CUSTOM PLAYER CONTROLS ══ */
+
+    /* Play / Pause button */
+    $('#cysp-playpause-btn').click(function() {
+        if (!cyspPlayer) return;
+        var state = cyspPlayer.getPlayerState();
+        if (state === YT.PlayerState.PLAYING) cyspPlayer.pauseVideo();
+        else cyspPlayer.playVideo();
+        cyspResetControlsTimer();
+    });
+
+    /* Click trên player (ngoài controls) → toggle play/pause */
+    $('#cysp-iframe-blocker').click(function() {
+        if (!cyspPlayer) return;
+        var state = cyspPlayer.getPlayerState();
+        if (state === YT.PlayerState.PLAYING) cyspPlayer.pauseVideo();
+        else cyspPlayer.playVideo();
+        cyspResetControlsTimer();
+    });
+
+    /* Mouse move → hiện controls */
+    $('#cysp-custom-player').on('mousemove touchstart', cyspResetControlsTimer);
+
+    /* ── Seek bar ── */
+    var progressWrap  = document.getElementById('cysp-progress-wrap');
+    var progressFill  = document.getElementById('cysp-progress-fill');
+    var progressThumb = document.getElementById('cysp-progress-thumb');
+    var progressTip   = document.getElementById('cysp-progress-tooltip');
+
+    function getSeekPct(e) {
+        var rect = progressWrap.getBoundingClientRect();
+        var x    = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+        return Math.max(0, Math.min(1, x / rect.width));
+    }
+
+    $(progressWrap).on('mousemove touchmove', function(e) {
+        e.preventDefault();
+        var pct = getSeekPct(e.originalEvent);
+        var dur = cyspPlayer ? (cyspPlayer.getDuration() || 0) : 0;
+        progressTip.textContent  = cyspFmtTime(pct * dur);
+        progressTip.style.left   = (pct * 100) + '%';
+        if (cyspIsSeeking) {
+            progressFill.style.width = (pct * 100) + '%';
+            progressThumb.style.left = (pct * 100) + '%';
+        }
+    }).on('mousedown touchstart', function(e) {
+        cyspIsSeeking = true;
+        var pct = getSeekPct(e.originalEvent);
+        progressFill.style.width = (pct * 100) + '%';
+        progressThumb.style.left = (pct * 100) + '%';
+    }).on('mouseup touchend click', function(e) {
+        var pct = getSeekPct(e.originalEvent);
+        if (cyspPlayer) {
+            var dur = cyspPlayer.getDuration() || 0;
+            cyspPlayer.seekTo(pct * dur, true);
+        }
+        cyspIsSeeking = false;
+        cyspResetControlsTimer();
+    });
+    $(document).on('mouseup', function() { cyspIsSeeking = false; });
+
+    /* ── Speed dropdown ── */
+    $('#cysp-speed-btn').click(function(e) {
+        e.stopPropagation();
+        $('#cysp-speed-dropdown').toggleClass('open');
+        cyspResetControlsTimer();
+    });
+    $(document).on('click', function() { $('#cysp-speed-dropdown').removeClass('open'); });
+    $(document).on('click', '.cysp-speed-opt', function() {
+        var rate = parseFloat($(this).data('rate'));
+        if (cyspPlayer) cyspPlayer.setPlaybackRate(rate);
+        $('.cysp-speed-opt').removeClass('cysp-speed-opt--active');
+        $(this).addClass('cysp-speed-opt--active');
+        $('#cysp-speed-label').text($(this).text());
+        $('#cysp-speed-dropdown').removeClass('open');
+        /* Sync shadowing pills */
+        $('.cysp-speed-pill').removeClass('cysp-speed-pill--active').attr('aria-pressed','false');
+        $('.cysp-speed-pill[data-rate="' + rate + '"]').addClass('cysp-speed-pill--active').attr('aria-pressed','true');
+    });
+
+    /* ── Volume ── */
+    $('#cysp-vol-input').on('input', function() {
+        var v = parseInt($(this).val());
+        if (cyspPlayer) cyspPlayer.setVolume(v);
+        $('#cysp-vol-fill').css('width', v + '%');
+        var volIcon  = $('#cysp-mute-btn .icon-vol')[0];
+        var muteIcon = $('#cysp-mute-btn .icon-mute')[0];
+        if (v === 0) { volIcon.style.display = 'none'; muteIcon.style.display = ''; }
+        else         { volIcon.style.display = '';     muteIcon.style.display = 'none'; }
+    });
+    $('#cysp-mute-btn').click(function() {
+        if (!cyspPlayer) return;
+        var inp = $('#cysp-vol-input');
+        if (cyspPlayer.isMuted()) {
+            cyspPlayer.unMute();
+            var v = cyspPlayer.getVolume();
+            inp.val(v); $('#cysp-vol-fill').css('width', v + '%');
+            $(this).find('.icon-vol').show();
+            $(this).find('.icon-mute').hide();
+        } else {
+            cyspPlayer.mute();
+            $(this).find('.icon-vol').hide();
+            $(this).find('.icon-mute').show();
+        }
+    });
+
+    /* ── Fullscreen ── */
+    $('#cysp-fs-btn').click(function() {
+        var el = document.getElementById('cysp-custom-player');
+        if (!document.fullscreenElement) {
+            (el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen).call(el);
+        } else {
+            (document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen).call(document);
+        }
+    });
+
+    /* Shadowing speed pills → sync player */
+    $('.cysp-speed-pill').click(function() {
+        $('.cysp-speed-pill').removeClass('cysp-speed-pill--active').attr('aria-pressed', 'false');
+        $(this).addClass('cysp-speed-pill--active').attr('aria-pressed', 'true');
+        var rate = parseFloat($(this).data('rate'));
+        if (cyspPlayer) cyspPlayer.setPlaybackRate(rate);
+        /* Sync speed dropdown */
+        $('.cysp-speed-opt').removeClass('cysp-speed-opt--active');
+        $('.cysp-speed-opt[data-rate="' + rate + '"]').addClass('cysp-speed-opt--active');
+        $('#cysp-speed-label').text(rate + '×');
+    });
+
+    /* ══ BUILD VIDEO CARD ══ */
     function buildItemHtml(item, hasLocal) {
         var vid   = item.id.videoId;
         var thumb = item.snippet.thumbnails.medium.url;
@@ -1022,7 +1265,6 @@ jQuery(document).ready(function($) {
             + '</div></div>';
     }
 
-    /* ── Library load ── */
     function loadLocalLibrary() {
         $('#cysp-loading').show();
         $.post('<?php echo $ajax_url; ?>', { action: 'cysp_get_local_videos', security: '<?php echo $nonce; ?>' }, function(res) {
@@ -1039,12 +1281,10 @@ jQuery(document).ready(function($) {
     }
     loadLocalLibrary();
 
-    /* ── Search ── */
     function performSearch() {
         var query = $('#cysp-search-input').val().trim();
         if (!query) { loadLocalLibrary(); return; }
-        $('#cysp-results').empty();
-        $('#cysp-loading').show();
+        $('#cysp-results').empty(); $('#cysp-loading').show();
         $.post('<?php echo $ajax_url; ?>', {
             action: 'cysp_search', security: '<?php echo $nonce; ?>',
             query: query, lang: $('#cysp-lang').val(),
@@ -1072,7 +1312,6 @@ jQuery(document).ready(function($) {
     $('#cysp-search-input').keypress(function(e) { if (e.which === 13) performSearch(); });
     $('.cysp-tag').click(function() { $('#cysp-search-input').val($(this).data('kw')); performSearch(); });
 
-    /* ── Click video card ── */
     $(document).on('click keypress', '.cysp-item', function(e) {
         if (e.type === 'keypress' && e.which !== 13) return;
         var vid = $(this).data('vid');
@@ -1089,10 +1328,7 @@ jQuery(document).ready(function($) {
     var cyspSentenceIndex = 0;
 
     function loadTranscript(vid, lp) {
-        cyspTranscript    = [];
-        cyspSentenceIndex = 0;
-        cyspAutoPlay      = false;
-
+        cyspTranscript = []; cyspSentenceIndex = 0; cyspAutoPlay = false;
         $('#dict-check-btn').prop('disabled', true);
         $('#dict-input').prop('disabled', true).val('');
         $('#cysp-mode-toolbar').hide();
@@ -1120,23 +1356,18 @@ jQuery(document).ready(function($) {
         });
     }
 
-    /* ── Select sentence ── */
     function selectSentence(idx) {
         if (!cyspTranscript || !cyspTranscript.length) return;
         idx = Math.max(0, Math.min(idx, cyspTranscript.length - 1));
         cyspSentenceIndex = idx;
-
         var seg   = cyspTranscript[idx];
         var label = (idx + 1) + '/' + cyspTranscript.length;
-
         $('#dict-sentence-text').text(seg.text).removeClass('revealed').addClass('cysp-sentence-text--blur');
         $('#shadow-sentence-text').text(seg.text).removeClass('revealed');
         $('#dict-sentence-idx, #shadow-sentence-idx').text(label);
         $('#dict-sentence-display, #shadow-sentence-display').show();
         $('#dict-countdown, #shadow-countdown').text('');
-
         cyspSentenceStart = seg.start;
-
         $('#dict-input').val('').prop('disabled', true);
         $('#dict-check-btn').prop('disabled', true);
         $('#dict-result, #shadow-result').hide();
@@ -1144,7 +1375,6 @@ jQuery(document).ready(function($) {
         $('#shadow-playback-row').hide();
         $('#shadow-clear-rec-btn').hide();
         $('#shadow-idle-label').text('Nhấn Phát để bắt đầu');
-
         if (cyspAutoPlay && cyspCurrentMode !== 'normal' && cyspPlayer) {
             if (cyspCurrentMode === 'dictation') {
                 playSentenceByIndex(idx, function() {
@@ -1162,7 +1392,6 @@ jQuery(document).ready(function($) {
         }
     }
 
-    /* ── Prev / Next ── */
     $('#dict-prev-btn, #shadow-prev-btn').click(function() {
         if (cyspTranscript.length) { cyspAutoPlay = true; selectSentence(cyspSentenceIndex - 1); }
     });
@@ -1170,10 +1399,8 @@ jQuery(document).ready(function($) {
         if (cyspTranscript.length) { cyspAutoPlay = true; selectSentence(cyspSentenceIndex + 1); }
     });
 
-    /* ── Switch mode ── */
     function switchMode(mode) {
-        cyspCurrentMode = mode;
-        cyspAutoPlay    = false;
+        cyspCurrentMode = mode; cyspAutoPlay = false;
         $('.cysp-mode-btn').removeClass('active').attr('aria-selected', 'false');
         $('.cysp-mode-btn[data-mode="' + mode + '"]').addClass('active').attr('aria-selected', 'true');
         $('#cysp-dictation-panel, #cysp-shadowing-panel').hide();
@@ -1185,32 +1412,25 @@ jQuery(document).ready(function($) {
         if (mode === 'shadowing') { $('#cysp-shadowing-panel').show(); if (cyspPlayer) cyspPlayer.pauseVideo(); }
     }
     $('.cysp-mode-btn').click(function() { switchMode($(this).data('mode')); });
-
     $('#shield-reveal-btn').click(function() { cyspRevealAndReplay(); });
 
-    /* ── Play sentence ── */
     function playSentenceByIndex(idx, onDone) {
         if (!cyspPlayer || !cyspTranscript.length) return;
         var seg   = cyspTranscript[idx];
         var durMs = Math.round(seg.dur * 1000) + 200;
         cyspSentenceStart = seg.start;
-
         clearTimeout(cyspPauseTimer);
         clearInterval(cyspProgressInterval);
-
         if (cyspCurrentMode === 'dictation') {
             cyspShowShield('Đang phát… hãy lắng nghe!');
             document.getElementById('shield-reveal-btn').style.display = 'none';
         }
-
         var elapsed = 0;
         var cdDict   = document.getElementById('dict-countdown');
         var cdShadow = document.getElementById('shadow-countdown');
         var cdShield = document.getElementById('shield-countdown');
-
         cyspPlayer.seekTo(seg.start, true);
         cyspPlayer.playVideo();
-
         cyspProgressInterval = setInterval(function() {
             elapsed += 100;
             var rem = Math.ceil((durMs - elapsed) / 1000);
@@ -1219,7 +1439,6 @@ jQuery(document).ready(function($) {
             if (cdShadow) cdShadow.textContent = txt;
             if (cdShield) cdShield.textContent = rem > 0 ? rem : '';
         }, 100);
-
         cyspPauseTimer = setTimeout(function() {
             clearInterval(cyspProgressInterval);
             cyspPlayer.pauseVideo();
@@ -1231,7 +1450,6 @@ jQuery(document).ready(function($) {
         }, durMs);
     }
 
-    /* ── Text compare ── */
     function sanitizeForCompare(str) {
         if (!str) return '';
         return str.replace(/[\s.,!?;:"'()\[\]{}，。！？、；：""（）《》【】]/g, '');
@@ -1241,26 +1459,17 @@ jQuery(document).ready(function($) {
         var len = Math.max(c1.length, c2.length), correct = 0, h1 = '', h2 = '';
         for (var i = 0; i < len; i++) {
             var a = i < c1.length ? c1[i] : '', b = i < c2.length ? c2[i] : '';
-            if (a && b && a === b) {
-                correct++;
-                h1 += '<span class="cysp-char-ok">' + esc(a) + '</span>';
-                h2 += '<span class="cysp-char-ok">' + esc(b) + '</span>';
-            } else {
-                if (a) h1 += '<span class="cysp-char-err">' + esc(a) + '</span>';
-                if (b) h2 += '<span class="cysp-char-err">' + esc(b) + '</span>';
-            }
+            if (a && b && a === b) { correct++; h1 += '<span class="cysp-char-ok">' + esc(a) + '</span>'; h2 += '<span class="cysp-char-ok">' + esc(b) + '</span>'; }
+            else { if (a) h1 += '<span class="cysp-char-err">' + esc(a) + '</span>'; if (b) h2 += '<span class="cysp-char-err">' + esc(b) + '</span>'; }
         }
         return { pct: len ? Math.round(correct / len * 100) : 0, html1: h1, html2: h2 };
     }
-    function buildResultHtml(pct, h1, h2, labelOriginal, labelUser) {
-        var cls   = pct === 100 ? 'correct' : (pct >= 60 ? 'partial' : 'wrong');
-        var emoji = pct === 100 ? '✓ ' : (pct >= 60 ? '⚠ ' : '✗ ');
-        return '<div class="cysp-result-box ' + cls + '">'
-            + '<span class="cysp-result-label">' + emoji + pct + '% chính xác</span>'
-            + '<div style="font-size:13px;line-height:2;">'
-            + '<span style="color:#999;font-size:11px;">' + labelOriginal + '&nbsp;</span>' + h1 + '<br>'
-            + '<span style="color:#999;font-size:11px;">' + labelUser     + '&nbsp;</span>' + h2
-            + '</div></div>';
+    function buildResultHtml(pct, h1, h2, lo, lu) {
+        var cls = pct === 100 ? 'correct' : (pct >= 60 ? 'partial' : 'wrong');
+        var em  = pct === 100 ? '✓ ' : (pct >= 60 ? '⚠ ' : '✗ ');
+        return '<div class="cysp-result-box ' + cls + '"><span class="cysp-result-label">' + em + pct + '% chính xác</span>'
+            + '<div style="font-size:13px;line-height:2;"><span style="color:#999;font-size:11px;">' + lo + '&nbsp;</span>' + h1
+            + '<br><span style="color:#999;font-size:11px;">' + lu + '&nbsp;</span>' + h2 + '</div></div>';
     }
     function esc(s)     { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
     function escAttr(s) { return esc(s).replace(/"/g,'&quot;'); }
@@ -1277,10 +1486,8 @@ jQuery(document).ready(function($) {
             $('#dict-check-btn').prop('disabled', false);
         });
     });
-
     $('#dict-check-btn').click(runDictCheck);
     $('#dict-input').keydown(function(e) { if (e.ctrlKey && e.which === 13) runDictCheck(); });
-
     function runDictCheck() {
         var userText = $('#dict-input').val().trim();
         if (!userText) return;
@@ -1310,34 +1517,16 @@ jQuery(document).ready(function($) {
         });
     });
 
-    $('.cysp-speed-pill').click(function() {
-        $('.cysp-speed-pill').removeClass('cysp-speed-pill--active').attr('aria-pressed', 'false');
-        $(this).addClass('cysp-speed-pill--active').attr('aria-pressed', 'true');
-        if (cyspPlayer) cyspPlayer.setPlaybackRate(parseFloat($(this).data('rate')));
-    });
-
     function startRecording() {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { alert('Trình duyệt không hỗ trợ thu âm.'); return; }
         if (typeof SpeechSDK === 'undefined') { alert('Thư viện Azure AI đang tải, vui lòng đợi và thử lại.'); return; }
         if (!AZURE_KEY || !AZURE_REGION) { alert('Admin chưa cấu hình Azure Speech Key & Region!'); return; }
-
-        $('#shadow-result').hide();
-        finalRecognizedText = '';
-
+        $('#shadow-result').hide(); finalRecognizedText = '';
         navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
-            cyspBeep();
-            isRecording = true;
-            audioChunks = [];
-
-            /* Đổi sang trạng thái recording */
-            $('#shadow-ctrl-idle').hide();
-            $('#shadow-ctrl-rec').show();
-            $('#shadow-rec-idle').hide();
-            $('#shadow-rec-live').show();
-            $('#shadow-idle-label').text('Nhấn Phát để bắt đầu');
-            $('#shadow-clear-rec-btn').hide();
-            $('#shadow-playback-row').hide();
-
+            cyspBeep(); isRecording = true; audioChunks = [];
+            $('#shadow-ctrl-idle').hide(); $('#shadow-ctrl-rec').show();
+            $('#shadow-rec-idle').hide(); $('#shadow-rec-live').show();
+            $('#shadow-clear-rec-btn').hide(); $('#shadow-playback-row').hide();
             mediaRecorder = new MediaRecorder(stream);
             mediaRecorder.start();
             mediaRecorder.addEventListener('dataavailable', function(e) { audioChunks.push(e.data); });
@@ -1346,16 +1535,12 @@ jQuery(document).ready(function($) {
                 document.getElementById('shadow-audio').src = URL.createObjectURL(blob);
                 stream.getTracks().forEach(function(t) { t.stop(); });
             });
-
-            recordSeconds = 0;
-            updateRecTimer();
+            recordSeconds = 0; updateRecTimer();
             recordTimer = setInterval(updateRecTimer, 1000);
-
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             analyser  = audioCtx.createAnalyser();
             audioCtx.createMediaStreamSource(stream).connect(analyser);
             drawWaveform();
-
             var speechConfig = SpeechSDK.SpeechConfig.fromSubscription(AZURE_KEY, AZURE_REGION);
             speechConfig.speechRecognitionLanguage = $('#cysp-lang').val() === 'zh-Hant' ? 'zh-TW' : 'zh-CN';
             var audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
@@ -1365,13 +1550,8 @@ jQuery(document).ready(function($) {
                     finalRecognizedText += e.result.text + ' ';
             };
             recognizer.canceled = function() { stopRecording(true); };
-            recognizer.startContinuousRecognitionAsync(
-                function() {},
-                function(err) { alert('Lỗi Azure: ' + err); stopRecording(true); }
-            );
-        }).catch(function() {
-            $('#shadow-idle-label').text('Không thể truy cập micro.');
-        });
+            recognizer.startContinuousRecognitionAsync(function(){}, function(err){ alert('Lỗi Azure: '+err); stopRecording(true); });
+        }).catch(function() { $('#shadow-idle-label').text('Không thể truy cập micro.'); });
     }
 
     function stopRecording(isError) {
@@ -1380,24 +1560,16 @@ jQuery(document).ready(function($) {
         if (mediaRecorder) mediaRecorder.stop();
         clearInterval(recordTimer);
         cancelAnimationFrame(animFrame);
-
-        /* Về ctrl idle */
-        $('#shadow-ctrl-rec').hide();
-        $('#shadow-ctrl-idle').show();
-        /* Về rec idle, hiện playback */
-        $('#shadow-rec-live').hide();
-        $('#shadow-rec-idle').show();
+        $('#shadow-ctrl-rec').hide(); $('#shadow-ctrl-idle').show();
+        $('#shadow-rec-live').hide(); $('#shadow-rec-idle').show();
         $('#shadow-idle-label').text('Bản ghi âm');
         $('#shadow-clear-rec-btn').show();
         $('#shadow-playback-row').css('display', 'flex');
-
         clearCanvas();
-
         if (recognizer) {
             $('#shadow-result').html('<em style="font-size:13px;color:#888;">AI đang phân tích…</em>').show();
             recognizer.stopContinuousRecognitionAsync(function() {
-                recognizer.close();
-                recognizer = undefined;
+                recognizer.close(); recognizer = undefined;
                 if (isError !== true) processAzureResult();
             });
         }
@@ -1448,24 +1620,17 @@ jQuery(document).ready(function($) {
         var cx = cv.getContext('2d');
         cx.fillStyle = '#0f0f1a'; cx.fillRect(0, 0, cv.width, cv.height);
         cx.strokeStyle = 'rgba(255,255,255,.1)'; cx.lineWidth = 0.5;
-        cx.beginPath(); cx.moveTo(0, cv.height / 2); cx.lineTo(cv.width, cv.height / 2); cx.stroke();
+        cx.beginPath(); cx.moveTo(0, cv.height/2); cx.lineTo(cv.width, cv.height/2); cx.stroke();
     }
 
-    $('#shadow-stop-btn').click(function() { stopRecording(); });
-
-    $('#shadow-listen-btn').click(function() {
-        document.getElementById('shadow-audio').play();
-    });
-
+    $('#shadow-stop-btn').click(function()  { stopRecording(); });
+    $('#shadow-listen-btn').click(function() { document.getElementById('shadow-audio').play(); });
     $('#shadow-clear-rec-btn').click(function() {
         document.getElementById('shadow-audio').src = '';
-        $('#shadow-playback-row').hide();
-        $('#shadow-clear-rec-btn').hide();
+        $('#shadow-playback-row').hide(); $('#shadow-clear-rec-btn').hide();
         $('#shadow-idle-label').text('Nhấn Phát để bắt đầu');
-        recordSeconds = 0;
-        $('#shadow-timer').text('00:00');
-        clearCanvas();
-        $('#shadow-result').hide();
+        recordSeconds = 0; $('#shadow-timer').text('00:00');
+        clearCanvas(); $('#shadow-result').hide();
     });
 
     clearCanvas();
