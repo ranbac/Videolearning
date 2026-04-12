@@ -1,8 +1,7 @@
-<?php
 /*
 Plugin Name: Custom YouTube Search Player (Chinese Learner Edition)
-Description: V9.1: Custom player controls — YouTube iframe chạy ngầm, toàn bộ UI tự làm, không logo YouTube. Fix: playSentenceByIndex theo dõi getCurrentTime() thực tế thay vì setTimeout cứng.
-Version: 9.1
+Description: V9.2: Session restore — khôi phục video/mode sau khi refresh trang. Custom player controls, YouTube iframe chạy ngầm, toàn bộ UI tự làm, không logo YouTube.
+Version: 9.2
 Author: Bạn (Upgraded)
 */
 
@@ -253,7 +252,7 @@ function cysp_handle_ajax_search() {
 }
 
 // ==========================================
-// 3. SHORTCODE HTML — V9.1
+// 3. SHORTCODE HTML — V9.2
 // ==========================================
 add_shortcode('yt_search_player', 'cysp_shortcode_html');
 function cysp_shortcode_html() {
@@ -565,7 +564,7 @@ function cysp_inject_scripts_and_styles() {
 
 <style>
 /* ============================================================
-   CYSP V9.1 — Design tokens
+   CYSP V9.2 — Design tokens
    ============================================================ */
 #cysp-container {
     --c-primary:        #d32f2f;
@@ -933,6 +932,38 @@ function cysp_inject_scripts_and_styles() {
 .cysp-skel--title  { height: 14px; margin: 0 12px 7px; border-radius: 3px; }
 .cysp-skel--sub    { height: 11px; margin: 0 12px; width: 60%; border-radius: 3px; }
 
+/* ── Session restore toast ── */
+#cysp-restore-toast {
+    display: none;
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #1a1a2e;
+    color: #fff;
+    padding: 12px 20px;
+    border-radius: 50px;
+    font-size: 13px;
+    font-weight: 500;
+    z-index: 9999;
+    box-shadow: 0 4px 20px rgba(0,0,0,.3);
+    white-space: nowrap;
+    gap: 10px;
+    align-items: center;
+}
+#cysp-restore-toast.show { display: flex; }
+#cysp-restore-toast-close {
+    background: transparent;
+    border: none;
+    color: rgba(255,255,255,.5);
+    cursor: pointer;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0;
+    margin-left: 4px;
+}
+#cysp-restore-toast-close:hover { color: #fff; }
+
 @media (max-width: 600px) {
     .cysp-search-wrapper { padding: 14px; }
     .cysp-filters { gap: 8px; }
@@ -947,8 +978,15 @@ function cysp_inject_scripts_and_styles() {
     .cysp-panel { padding: 12px 12px; }
     .cysp-results-grid, .cysp-skeleton-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
     .cysp-vol-slider-wrap { display: none; }
+    #cysp-restore-toast { font-size: 12px; padding: 10px 16px; bottom: 16px; max-width: 90vw; white-space: normal; text-align: center; border-radius: 16px; }
 }
 </style>
+
+<!-- Session restore toast -->
+<div id="cysp-restore-toast">
+    <span id="cysp-restore-toast-msg">⏮ Đang khôi phục bài học trước...</span>
+    <button id="cysp-restore-toast-close" aria-label="Đóng">×</button>
+</div>
 
 <script>
 const AZURE_KEY    = "<?php echo esc_js($azure_key); ?>";
@@ -969,6 +1007,52 @@ var cyspDuration      = 0;
 var cyspProgressRAF   = null;
 var cyspIsSeeking     = false;
 var cyspControlsTimer = null;
+
+/* ══════════════════════════════════════════
+   SESSION STORAGE HELPERS — V9.2
+   Lưu/đọc trạng thái video để khôi phục sau refresh
+══════════════════════════════════════════ */
+var CYSP_SS_VID   = 'cysp_vid';
+var CYSP_SS_LP    = 'cysp_lp';
+var CYSP_SS_MODE  = 'cysp_mode';
+var CYSP_SS_IDX   = 'cysp_idx';
+var CYSP_SS_TIME  = 'cysp_time';
+
+function cyspSaveSession() {
+    try {
+        sessionStorage.setItem(CYSP_SS_VID,  cyspCurrentVid);
+        sessionStorage.setItem(CYSP_SS_LP,   cyspCurrentLp);
+        sessionStorage.setItem(CYSP_SS_MODE, cyspCurrentMode);
+        sessionStorage.setItem(CYSP_SS_IDX,  cyspSentenceIndex || 0);
+        if (cyspPlayer) {
+            try { sessionStorage.setItem(CYSP_SS_TIME, cyspPlayer.getCurrentTime() || 0); } catch(e) {}
+        }
+    } catch(e) {}
+}
+
+function cyspClearSession() {
+    try {
+        sessionStorage.removeItem(CYSP_SS_VID);
+        sessionStorage.removeItem(CYSP_SS_LP);
+        sessionStorage.removeItem(CYSP_SS_MODE);
+        sessionStorage.removeItem(CYSP_SS_IDX);
+        sessionStorage.removeItem(CYSP_SS_TIME);
+    } catch(e) {}
+}
+
+function cyspGetSession() {
+    try {
+        var vid = sessionStorage.getItem(CYSP_SS_VID);
+        if (!vid) return null;
+        return {
+            vid:  vid,
+            lp:   sessionStorage.getItem(CYSP_SS_LP)   || 'zh-CN',
+            mode: sessionStorage.getItem(CYSP_SS_MODE)  || 'normal',
+            idx:  parseInt(sessionStorage.getItem(CYSP_SS_IDX) || '0', 10),
+            time: parseFloat(sessionStorage.getItem(CYSP_SS_TIME) || '0'),
+        };
+    } catch(e) { return null; }
+}
 
 function onYouTubeIframeAPIReady() { }
 
@@ -1278,6 +1362,8 @@ jQuery(document).ready(function($) {
 
     function performSearch() {
         var query = $('#cysp-search-input').val().trim();
+        /* Reset session khi người dùng tìm kiếm mới */
+        cyspClearSession();
         if (!query) { loadLocalLibrary(); return; }
         $('#cysp-results').empty(); $('#cysp-loading').show();
         $.post('<?php echo $ajax_url; ?>', {
@@ -1307,10 +1393,18 @@ jQuery(document).ready(function($) {
     $('#cysp-search-input').keypress(function(e) { if (e.which === 13) performSearch(); });
     $('.cysp-tag').click(function() { $('#cysp-search-input').val($(this).data('kw')); performSearch(); });
 
+    /* ── Chọn video ── */
     $(document).on('click keypress', '.cysp-item', function(e) {
         if (e.type === 'keypress' && e.which !== 13) return;
         var vid = $(this).data('vid');
         var lp  = $('#cysp-lang').val() === 'zh-Hant' ? 'zh-TW' : 'zh-CN';
+
+        /* Lưu session ngay khi chọn video */
+        cyspCurrentVid  = vid;
+        cyspCurrentLp   = lp;
+        cyspCurrentMode = 'normal';
+        cyspSaveSession();
+
         if (!cyspInitPlayer(vid, lp)) return;
         cyspAutoPlay = false;
         cyspHideShield();
@@ -1341,6 +1435,7 @@ jQuery(document).ready(function($) {
                 $('#cysp-transcript-error').html('<strong>Video này chưa có file Dictation/Shadowing.</strong> Đang ở chế độ Xem thường.').show();
                 setTimeout(function() { $('#cysp-transcript-error').slideUp(); }, 7000);
                 cyspCurrentMode = 'normal';
+                cyspSaveSession();
                 if (cyspPlayer && typeof cyspPlayer.playVideo === 'function') cyspPlayer.playVideo();
                 return;
             }
@@ -1370,6 +1465,10 @@ jQuery(document).ready(function($) {
         $('#shadow-playback-row').hide();
         $('#shadow-clear-rec-btn').hide();
         $('#shadow-idle-label').text('Nhấn Phát để bắt đầu');
+
+        /* Lưu index câu vào session */
+        cyspSaveSession();
+
         if (cyspAutoPlay && cyspCurrentMode !== 'normal' && cyspPlayer) {
             if (cyspCurrentMode === 'dictation') {
                 playSentenceByIndex(idx, function() {
@@ -1396,6 +1495,10 @@ jQuery(document).ready(function($) {
 
     function switchMode(mode) {
         cyspCurrentMode = mode; cyspAutoPlay = false;
+
+        /* Lưu mode vào session */
+        cyspSaveSession();
+
         $('.cysp-mode-btn').removeClass('active').attr('aria-selected', 'false');
         $('.cysp-mode-btn[data-mode="' + mode + '"]').addClass('active').attr('aria-selected', 'true');
         $('#cysp-dictation-panel, #cysp-shadowing-panel').hide();
@@ -1412,17 +1515,14 @@ jQuery(document).ready(function($) {
     /* ══════════════════════════════════════════════════════════
        playSentenceByIndex — V9.1 FIX
        Theo dõi getCurrentTime() thực tế thay vì setTimeout cứng.
-       Tránh dừng sớm khi YouTube cần thêm thời gian buffer/seek.
     ══════════════════════════════════════════════════════════ */
     function playSentenceByIndex(idx, onDone) {
         if (!cyspPlayer || !cyspTranscript.length) return;
         var seg = cyspTranscript[idx];
         cyspSentenceStart = seg.start;
 
-        /* Thêm 0.4s buffer để chắc chắn audio không bị cắt sớm */
         var endTime = seg.start + seg.dur + 0.4;
 
-        /* Dọn dẹp bất kỳ timer/interval nào đang chạy */
         clearTimeout(cyspPauseTimer);
         clearInterval(cyspProgressInterval);
 
@@ -1457,23 +1557,16 @@ jQuery(document).ready(function($) {
         cyspPlayer.seekTo(seg.start, true);
         cyspPlayer.playVideo();
 
-        /*
-         * Poll mỗi 80ms — theo dõi currentTime thực tế.
-         * Chỉ bắt đầu đếm ngược sau khi player thực sự
-         * đang PLAYING và đã seek đến gần vị trí đúng.
-         */
         watchInterval = setInterval(function() {
             if (isDone) return;
             try {
                 var state = cyspPlayer.getPlayerState();
                 var cur   = cyspPlayer.getCurrentTime();
 
-                /* Xác nhận video đã bắt đầu phát tại vị trí câu */
                 if (!hasStarted && state === YT.PlayerState.PLAYING && cur >= seg.start - 0.8) {
                     hasStarted = true;
                 }
 
-                /* Cập nhật countdown chỉ khi đã bắt đầu phát */
                 if (hasStarted) {
                     var rem = Math.ceil(endTime - cur);
                     var txt = rem > 0 ? rem + 's' : '';
@@ -1481,7 +1574,6 @@ jQuery(document).ready(function($) {
                     if (cdShadow) cdShadow.textContent = txt;
                     if (cdShield) cdShield.textContent = rem > 0 ? rem : '';
 
-                    /* Dừng khi đã qua endTime */
                     if (cur >= endTime) {
                         cleanup();
                     }
@@ -1489,10 +1581,6 @@ jQuery(document).ready(function($) {
             } catch(e) { cleanup(); }
         }, 80);
 
-        /*
-         * Safety fallback: nếu sau (dur + 8s) vẫn chưa kết thúc
-         * (ví dụ: mạng cực chậm, video không load được) thì thoát.
-         */
         safetyTimer = setTimeout(function() {
             if (!isDone) cleanup();
         }, (seg.dur + 8) * 1000);
@@ -1683,6 +1771,101 @@ jQuery(document).ready(function($) {
 
     clearCanvas();
     $(window).on('resize', function() { if (!isRecording) clearCanvas(); });
+
+    /* ── Toast close button ── */
+    $('#cysp-restore-toast-close').click(function() {
+        $('#cysp-restore-toast').removeClass('show');
+    });
+
+    /* ══════════════════════════════════════════════════════════
+       SESSION RESTORE — V9.2
+       Khôi phục video + mode + câu sau khi refresh trang.
+       Chờ YT API sẵn sàng rồi mới init player.
+    ══════════════════════════════════════════════════════════ */
+    (function restoreSession() {
+        var ss = cyspGetSession();
+        if (!ss || !ss.vid) return;
+
+        /* Hiện toast thông báo */
+        $('#cysp-restore-toast-msg').text('⏮ Đang khôi phục bài học trước...');
+        $('#cysp-restore-toast').addClass('show');
+
+        /* Đồng bộ dropdown ngôn ngữ với session đã lưu */
+        if (ss.lp === 'zh-TW') {
+            $('#cysp-lang').val('zh-Hant');
+        } else {
+            $('#cysp-lang').val('zh-Hans');
+        }
+
+        /* Polling chờ YT API + Player sẵn sàng */
+        var ytWait = setInterval(function() {
+            if (typeof YT === 'undefined' || typeof YT.Player === 'undefined') return;
+            clearInterval(ytWait);
+
+            cyspCurrentVid  = ss.vid;
+            cyspCurrentLp   = ss.lp;
+            cyspCurrentMode = ss.mode;
+
+            if (!cyspInitPlayer(ss.vid, ss.lp)) {
+                $('#cysp-restore-toast').removeClass('show');
+                return;
+            }
+
+            $('#cysp-player-container').show();
+
+            /* Seek đến vị trí đã lưu sau khi player sẵn sàng */
+            if (ss.time > 5) {
+                var seekWait = setInterval(function() {
+                    try {
+                        if (cyspPlayer && cyspPlayer.seekTo) {
+                            cyspPlayer.seekTo(ss.time, true);
+                            clearInterval(seekWait);
+                        }
+                    } catch(e) {}
+                }, 400);
+                setTimeout(function() { clearInterval(seekWait); }, 8000);
+            }
+
+            /* Load transcript rồi phục hồi mode + câu */
+            $.post('<?php echo $ajax_url; ?>', {
+                action:   'cysp_get_transcript',
+                security: '<?php echo $nonce; ?>',
+                video_id: ss.vid,
+                lang:     ss.lp
+            }, function(res) {
+                $('#cysp-transcript-loading').hide();
+
+                if (!res.success) {
+                    /* Không có transcript, ở lại mode normal */
+                    cyspCurrentMode = 'normal';
+                    cyspSaveSession();
+                    if (cyspPlayer) cyspPlayer.playVideo();
+                    $('#cysp-restore-toast').removeClass('show');
+                    return;
+                }
+
+                $('#cysp-mode-toolbar').fadeIn(200);
+                cyspTranscript = res.data;
+
+                /* Khôi phục đúng câu */
+                var targetIdx = Math.max(0, Math.min(ss.idx, cyspTranscript.length - 1));
+                cyspAutoPlay = false;
+                selectSentence(targetIdx);
+
+                /* Khôi phục mode */
+                switchMode(ss.mode);
+
+                /* Cập nhật toast thành công */
+                var modeLabel = ss.mode === 'dictation' ? 'Dictation' : (ss.mode === 'shadowing' ? 'Shadowing' : 'Xem thường');
+                $('#cysp-restore-toast-msg').text('✓ Đã khôi phục — ' + modeLabel + ' — câu ' + (targetIdx + 1));
+                setTimeout(function() { $('#cysp-restore-toast').removeClass('show'); }, 3000);
+            });
+
+        }, 300);
+
+        /* Safety: nếu sau 12s YT API vẫn không load xong, bỏ qua */
+        setTimeout(function() { clearInterval(ytWait); $('#cysp-restore-toast').removeClass('show'); }, 12000);
+    })();
 
 }); /* end jQuery ready */
 </script>
