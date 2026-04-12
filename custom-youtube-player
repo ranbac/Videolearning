@@ -1,7 +1,8 @@
+<?php
 /*
 Plugin Name: Custom YouTube Search Player (Chinese Learner Edition)
-Description: V9.0: Custom player controls — YouTube iframe chạy ngầm, toàn bộ UI tự làm, không logo YouTube.
-Version: 9.0
+Description: V9.1: Custom player controls — YouTube iframe chạy ngầm, toàn bộ UI tự làm, không logo YouTube. Fix: playSentenceByIndex theo dõi getCurrentTime() thực tế thay vì setTimeout cứng.
+Version: 9.1
 Author: Bạn (Upgraded)
 */
 
@@ -252,7 +253,7 @@ function cysp_handle_ajax_search() {
 }
 
 // ==========================================
-// 3. SHORTCODE HTML — V9
+// 3. SHORTCODE HTML — V9.1
 // ==========================================
 add_shortcode('yt_search_player', 'cysp_shortcode_html');
 function cysp_shortcode_html() {
@@ -564,7 +565,7 @@ function cysp_inject_scripts_and_styles() {
 
 <style>
 /* ============================================================
-   CYSP V9 — Design tokens
+   CYSP V9.1 — Design tokens
    ============================================================ */
 #cysp-container {
     --c-primary:        #d32f2f;
@@ -621,13 +622,12 @@ function cysp_inject_scripts_and_styles() {
     width: 100%;
     aspect-ratio: 16 / 9;
     overflow: hidden;
-    /* Khi fullscreen thì aspect-ratio tự reset */
 }
 .cysp-custom-player:-webkit-full-screen { aspect-ratio: unset; width: 100vw; height: 100vh; }
 .cysp-custom-player:-moz-full-screen    { aspect-ratio: unset; width: 100vw; height: 100vh; }
 .cysp-custom-player:fullscreen          { aspect-ratio: unset; width: 100vw; height: 100vh; }
 
-/* YouTube iframe — chiếm toàn bộ player, ẩn sau blocker */
+/* YouTube iframe */
 .cysp-yt-hidden-wrap {
     position: absolute;
     inset: 0;
@@ -636,16 +636,15 @@ function cysp_inject_scripts_and_styles() {
 .cysp-yt-hidden-wrap iframe,
 #cysp-yt-player {
     position: absolute;
-    /* Phóng to hơn container để cắt hết thanh trên/dưới của YouTube */
     top: -60px;
     left: -10px;
     width: calc(100% + 20px);
     height: calc(100% + 120px);
     border: none;
-    pointer-events: none; /* Không cho click vào iframe */
+    pointer-events: none;
 }
 
-/* Lớp trong suốt che toàn bộ iframe — khoá mọi tương tác với YT UI */
+/* Lớp trong suốt che toàn bộ iframe */
 .cysp-iframe-blocker {
     position: absolute;
     inset: 0;
@@ -659,7 +658,7 @@ function cysp_inject_scripts_and_styles() {
     display: none;
     position: absolute;
     inset: 0;
-    z-index: 20;
+    z-index: 25;
     background: var(--c-surface-deep);
     align-items: center;
     justify-content: center;
@@ -822,9 +821,6 @@ function cysp_inject_scripts_and_styles() {
     margin: 0;
 }
 
-/* ── Shield overlay ── */
-#cysp-shield { z-index: 25; } /* above iframe-blocker (2) + controls (30) — actually controls are below shield */
-
 /* ── Mode toolbar ── */
 #cysp-mode-toolbar { display: flex; background: var(--c-surface); }
 .cysp-mode-btn { flex: 1; padding: 12px 8px; border: none; background: transparent; color: rgba(255,255,255,.45); font-size: 13px; font-weight: 500; font-family: inherit; cursor: pointer; border-bottom: 2.5px solid transparent; transition: color .15s, background .15s, border-color .15s; }
@@ -950,7 +946,7 @@ function cysp_inject_scripts_and_styles() {
     .cysp-speed-row { flex-wrap: wrap; }
     .cysp-panel { padding: 12px 12px; }
     .cysp-results-grid, .cysp-skeleton-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 12px; }
-    .cysp-vol-slider-wrap { display: none; } /* ẩn thanh âm lượng trên mobile */
+    .cysp-vol-slider-wrap { display: none; }
 }
 </style>
 
@@ -1048,14 +1044,13 @@ function cyspInitPlayer(videoId, langPref) {
             disablekb:      1,
             fs:             0,
             playsinline:    1,
-            controls:       0,   /* ← Tắt toàn bộ controls YouTube */
+            controls:       0,
             showinfo:       0,
         },
         events: {
             onReady: function(e) {
                 e.target.playVideo();
                 cyspStartProgressLoop();
-                /* Sync volume slider */
                 try {
                     var v = e.target.getVolume();
                     document.getElementById('cysp-vol-input').value = v;
@@ -1414,40 +1409,93 @@ jQuery(document).ready(function($) {
     $('.cysp-mode-btn').click(function() { switchMode($(this).data('mode')); });
     $('#shield-reveal-btn').click(function() { cyspRevealAndReplay(); });
 
+    /* ══════════════════════════════════════════════════════════
+       playSentenceByIndex — V9.1 FIX
+       Theo dõi getCurrentTime() thực tế thay vì setTimeout cứng.
+       Tránh dừng sớm khi YouTube cần thêm thời gian buffer/seek.
+    ══════════════════════════════════════════════════════════ */
     function playSentenceByIndex(idx, onDone) {
         if (!cyspPlayer || !cyspTranscript.length) return;
-        var seg   = cyspTranscript[idx];
-        var durMs = Math.round(seg.dur * 1000) + 200;
+        var seg = cyspTranscript[idx];
         cyspSentenceStart = seg.start;
+
+        /* Thêm 0.4s buffer để chắc chắn audio không bị cắt sớm */
+        var endTime = seg.start + seg.dur + 0.4;
+
+        /* Dọn dẹp bất kỳ timer/interval nào đang chạy */
         clearTimeout(cyspPauseTimer);
         clearInterval(cyspProgressInterval);
+
         if (cyspCurrentMode === 'dictation') {
             cyspShowShield('Đang phát… hãy lắng nghe!');
             document.getElementById('shield-reveal-btn').style.display = 'none';
         }
-        var elapsed = 0;
+
         var cdDict   = document.getElementById('dict-countdown');
         var cdShadow = document.getElementById('shadow-countdown');
         var cdShield = document.getElementById('shield-countdown');
-        cyspPlayer.seekTo(seg.start, true);
-        cyspPlayer.playVideo();
-        cyspProgressInterval = setInterval(function() {
-            elapsed += 100;
-            var rem = Math.ceil((durMs - elapsed) / 1000);
-            var txt = rem > 0 ? rem + 's' : '';
-            if (cdDict)   cdDict.textContent   = txt;
-            if (cdShadow) cdShadow.textContent = txt;
-            if (cdShield) cdShield.textContent = rem > 0 ? rem : '';
-        }, 100);
-        cyspPauseTimer = setTimeout(function() {
-            clearInterval(cyspProgressInterval);
-            cyspPlayer.pauseVideo();
+
+        var hasStarted   = false;
+        var watchInterval = null;
+        var safetyTimer   = null;
+        var isDone        = false;
+
+        function cleanup() {
+            if (isDone) return;
+            isDone = true;
+            clearInterval(watchInterval);
+            clearTimeout(safetyTimer);
+            if (cyspPlayer) cyspPlayer.pauseVideo();
             if (cdDict)   cdDict.textContent   = '';
             if (cdShadow) cdShadow.textContent = '';
             if (cdShield) cdShield.textContent = '';
-            document.getElementById('shield-msg').innerHTML = 'Video đã dừng.<br>Hãy gõ / nói lại những gì bạn nghe được!';
+            document.getElementById('shield-msg').innerHTML =
+                'Video đã dừng.<br>Hãy gõ / nói lại những gì bạn nghe được!';
             if (onDone) onDone();
-        }, durMs);
+        }
+
+        cyspPlayer.seekTo(seg.start, true);
+        cyspPlayer.playVideo();
+
+        /*
+         * Poll mỗi 80ms — theo dõi currentTime thực tế.
+         * Chỉ bắt đầu đếm ngược sau khi player thực sự
+         * đang PLAYING và đã seek đến gần vị trí đúng.
+         */
+        watchInterval = setInterval(function() {
+            if (isDone) return;
+            try {
+                var state = cyspPlayer.getPlayerState();
+                var cur   = cyspPlayer.getCurrentTime();
+
+                /* Xác nhận video đã bắt đầu phát tại vị trí câu */
+                if (!hasStarted && state === YT.PlayerState.PLAYING && cur >= seg.start - 0.8) {
+                    hasStarted = true;
+                }
+
+                /* Cập nhật countdown chỉ khi đã bắt đầu phát */
+                if (hasStarted) {
+                    var rem = Math.ceil(endTime - cur);
+                    var txt = rem > 0 ? rem + 's' : '';
+                    if (cdDict)   cdDict.textContent   = txt;
+                    if (cdShadow) cdShadow.textContent = txt;
+                    if (cdShield) cdShield.textContent = rem > 0 ? rem : '';
+
+                    /* Dừng khi đã qua endTime */
+                    if (cur >= endTime) {
+                        cleanup();
+                    }
+                }
+            } catch(e) { cleanup(); }
+        }, 80);
+
+        /*
+         * Safety fallback: nếu sau (dur + 8s) vẫn chưa kết thúc
+         * (ví dụ: mạng cực chậm, video không load được) thì thoát.
+         */
+        safetyTimer = setTimeout(function() {
+            if (!isDone) cleanup();
+        }, (seg.dur + 8) * 1000);
     }
 
     function sanitizeForCompare(str) {
