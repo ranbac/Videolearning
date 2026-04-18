@@ -1,7 +1,7 @@
 /*
 Plugin Name: Custom YouTube Search Player (Chinese Learner Edition)
-Description: V9.4: Tìm kiếm thông minh, Tab Đã học, 12 Tag Chủ đề, Fix UI Mobile (tràn nút tìm kiếm, mất mũi tên select) kháng Theme 100%.
-Version: 9.4
+Description: V9.6.1: Lưu Lịch sử & Yêu thích vào Tài khoản, Fix lỗi ẩn thanh Tab Khám phá/Đã học/Yêu thích.
+Version: 9.6.1
 Author: Bạn (Upgraded)
 */
 
@@ -200,7 +200,6 @@ function cysp_handle_get_local_videos() {
     $transcript_dir = $upload_dir['basedir'] . '/cysp_transcripts/';
     
     $local_items = cysp_get_all_local_videos_metadata($api_key, $transcript_dir);
-    // Lấy 50 video mới nhất
     $local_items = array_slice(array_reverse($local_items), 0, 50);
     
     wp_send_json_success($local_items);
@@ -247,16 +246,13 @@ function cysp_handle_ajax_search() {
     $upload_dir     = wp_upload_dir();
     $transcript_dir = $upload_dir['basedir'] . '/cysp_transcripts/';
     
-    // ── ƯU TIÊN VIDEO LOCAL CÓ CHỨA TỪ KHÓA (BỎ QUA KHOẢNG TRẮNG) ──
     $local_items = cysp_get_all_local_videos_metadata($api_key, $transcript_dir);
     $matched_local = [];
     if (!empty($query)) {
         $normalized_query = str_replace(' ', '', mb_strtolower($query, 'UTF-8'));
-        
         foreach ($local_items as $item) {
             $title = isset($item->snippet->title) ? $item->snippet->title : '';
             $normalized_title = str_replace(' ', '', mb_strtolower($title, 'UTF-8'));
-            
             if (mb_strpos($normalized_title, $normalized_query, 0, 'UTF-8') !== false) {
                 $matched_local[] = $item;
             }
@@ -266,13 +262,11 @@ function cysp_handle_ajax_search() {
     $split_results = ['with_transcript' => [], 'without_transcript' => []];
     $seen = [];
 
-    // Nhét các video local khớp từ khóa lên đầu (With transcript)
     foreach ($matched_local as $item) {
         $split_results['with_transcript'][] = $item;
         $seen[$item->id->videoId] = true;
     }
 
-    // Tiếp tục xử lý kết quả YT
     foreach ($yt_items as $item) {
         if (!isset($item->id->videoId)) continue;
         $vid = $item->id->videoId;
@@ -288,6 +282,51 @@ function cysp_handle_ajax_search() {
 }
 
 // ==========================================
+// 2E. AJAX ĐỒNG BỘ DỮ LIỆU NGƯỜI DÙNG (DB SYNC)
+// ==========================================
+add_action('wp_ajax_cysp_sync_user_data', 'cysp_handle_sync_user_data');
+function cysp_handle_sync_user_data() {
+    check_ajax_referer('cysp_search_secure_nonce', 'security');
+    if (!is_user_logged_in()) wp_send_json_error('Not logged in');
+
+    $user_id = get_current_user_id();
+    $action  = isset($_POST['sync_action']) ? sanitize_text_field($_POST['sync_action']) : '';
+
+    if ($action === 'get') {
+        $history   = get_user_meta($user_id, 'cysp_user_history', true) ?: [];
+        $favorites = get_user_meta($user_id, 'cysp_user_favorites', true) ?: [];
+        wp_send_json_success(['history' => $history, 'favorites' => $favorites]);
+    } 
+    elseif ($action === 'update_history') {
+        $vid  = sanitize_text_field($_POST['vid']);
+        $data = isset($_POST['data']) ? json_decode(stripslashes($_POST['data']), true) : null;
+        if ($vid && $data) {
+            $history = get_user_meta($user_id, 'cysp_user_history', true) ?: [];
+            $history[$vid] = $data;
+            update_user_meta($user_id, 'cysp_user_history', $history);
+            wp_send_json_success();
+        }
+    } 
+    elseif ($action === 'toggle_favorite') {
+        $vid    = sanitize_text_field($_POST['vid']);
+        $data   = isset($_POST['data']) ? json_decode(stripslashes($_POST['data']), true) : null;
+        $is_add = filter_var($_POST['is_add'], FILTER_VALIDATE_BOOLEAN);
+        
+        if ($vid) {
+            $favorites = get_user_meta($user_id, 'cysp_user_favorites', true) ?: [];
+            if ($is_add && $data) {
+                $favorites[$vid] = $data;
+            } else {
+                unset($favorites[$vid]);
+            }
+            update_user_meta($user_id, 'cysp_user_favorites', $favorites);
+            wp_send_json_success();
+        }
+    }
+    wp_send_json_error('Invalid action');
+}
+
+// ==========================================
 // 3. SHORTCODE HTML
 // ==========================================
 add_shortcode('yt_search_player', 'cysp_shortcode_html');
@@ -296,6 +335,13 @@ function cysp_shortcode_html() {
     ob_start(); ?>
 
 <div id="cysp-container">
+
+    <?php if (!is_user_logged_in()): ?>
+        <div style="background: #FFF3E0; border: 1px solid #FFCC80; padding: 10px 14px; border-radius: var(--radius); margin-bottom: 20px; font-size: 13px; color: #E65100; display:flex; align-items: center; gap:8px;">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
+            <div>Bạn đang dùng tư cách <strong>Khách</strong>. Dữ liệu chỉ được lưu tạm trên thiết bị này. <a href="<?php echo esc_url(wp_login_url(get_permalink())); ?>" style="color:#D84315; font-weight:bold; text-decoration:underline;">Đăng nhập</a> để đồng bộ đám mây.</div>
+        </div>
+    <?php endif; ?>
 
     <div class="cysp-search-wrapper">
         <div class="cysp-search-bar">
@@ -501,9 +547,12 @@ function cysp_shortcode_html() {
             <div id="shadow-result" class="cysp-result-box" style="display:none;" role="alert"></div>
         </div>
 
-    </div><div class="cysp-main-tabs" id="cysp-main-tabs" style="display:none;">
+    </div>
+    
+    <div class="cysp-main-tabs" id="cysp-main-tabs">
         <button class="cysp-main-tab active" data-tab="search">Khám phá</button>
         <button class="cysp-main-tab" data-tab="history">Đã học (<span id="cysp-history-count">0</span>)</button>
+        <button class="cysp-main-tab" data-tab="favorites">Yêu thích (<span id="cysp-fav-count">0</span>)</button>
     </div>
 
     <div id="cysp-tab-search-content">
@@ -520,6 +569,10 @@ function cysp_shortcode_html() {
 
     <div id="cysp-tab-history-content" style="display:none;">
         <div class="cysp-results-grid" id="cysp-history-grid"></div>
+    </div>
+
+    <div id="cysp-tab-favorites-content" style="display:none;">
+        <div class="cysp-results-grid" id="cysp-favorites-grid"></div>
     </div>
 
 </div><?php return ob_get_clean();
@@ -566,7 +619,7 @@ function cysp_inject_scripts_and_styles() {
     margin: 0 auto;
 }
 
-/* ── Search wrapper & Tags (ĐÃ FIX CHỐNG LỖI THEME WORDPRESS) ── */
+/* ── Search wrapper & Tags ── */
 .cysp-search-wrapper { margin-bottom: 24px; padding: 20px; background: #fff; border: 0.5px solid #e5e5e5; border-radius: var(--radius-lg); box-sizing: border-box; }
 .cysp-search-bar { display: flex; flex-wrap: nowrap; align-items: stretch; gap: 10px; margin-bottom: 18px; width: 100%; box-sizing: border-box; }
 #cysp-search-input { flex: 1 1 100%; min-width: 50px; padding: 11px 14px; border: 1.5px solid #e5e5e5; border-radius: var(--radius); font-size: 15px; outline: none; box-sizing: border-box; margin: 0; }
@@ -607,7 +660,7 @@ function cysp_inject_scripts_and_styles() {
 }
 .cysp-filter-group select::-ms-expand { display: none; }
 
-/* ── Main Tabs (Đã học / Khám phá) ── */
+/* ── Main Tabs (Đã học / Khám phá / Yêu thích) ── */
 .cysp-main-tabs { display: flex; gap: 20px; margin-bottom: 20px; border-bottom: 1px solid #e5e5e5; }
 .cysp-main-tab { padding: 12px 0; border: none; background: transparent; font-size: 15px; font-weight: 600; color: #777; cursor: pointer; border-bottom: 3px solid transparent; margin-bottom: -1px; transition: color .2s; }
 .cysp-main-tab:hover { color: #333; }
@@ -736,7 +789,7 @@ function cysp_inject_scripts_and_styles() {
 /* ── Results grid & History Stats ── */
 .cysp-section-title { font-size: 16px; font-weight: 600; color: #1a1a2e; margin: 24px 0 14px; padding-bottom: 8px; border-bottom: 0.5px solid #e5e5e5; }
 .cysp-results-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 16px; margin-bottom: 28px; }
-.cysp-item { cursor: pointer; border-radius: var(--radius-lg); overflow: hidden; background: #fff; border: 0.5px solid #e5e5e5; transition: transform .2s, box-shadow .2s; display: flex; flex-direction: column; }
+.cysp-item { cursor: pointer; border-radius: var(--radius-lg); overflow: hidden; background: #fff; border: 0.5px solid #e5e5e5; transition: transform .2s, box-shadow .2s; display: flex; flex-direction: column; position: relative; }
 .cysp-item:hover { transform: translateY(-4px); box-shadow: 0 8px 24px rgba(0,0,0,.1); }
 .cysp-thumb-wrap { position: relative; aspect-ratio: 16/9; overflow: hidden; background: #111; }
 .cysp-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .3s; }
@@ -751,6 +804,14 @@ function cysp_inject_scripts_and_styles() {
 .cysp-card-title { font-size: 13px; font-weight: 500; color: #1a1a2e; margin: 0 0 5px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .cysp-card-channel { font-size: 12px; color: #999; display: flex; align-items: center; gap: 5px; margin:0; }
 .cysp-card-channel svg { width: 11px; height: 11px; flex-shrink: 0; }
+
+/* ── NÚT YÊU THÍCH (TRÁI TIM) ── */
+.cysp-fav-btn { position: absolute; top: 8px; right: 8px; width: 32px; height: 32px; background: rgba(0,0,0,0.55); border: none; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; z-index: 10; color: #fff; transition: background 0.2s, transform 0.1s; padding: 0; }
+.cysp-fav-btn:hover { background: rgba(0,0,0,0.8); transform: scale(1.1); }
+.cysp-fav-btn svg { width: 16px; height: 16px; }
+.cysp-fav-btn.active { background: rgba(255, 255, 255, 0.95); }
+.cysp-fav-btn.active .icon-heart-in { display: block !important; }
+.cysp-fav-btn.active .icon-heart-out { display: none !important; }
 
 /* History Progress Bar */
 .cysp-history-progress { margin-top: 10px; }
@@ -773,6 +834,9 @@ function cysp_inject_scripts_and_styles() {
 
 /* FIX UI MOBILE CHO PHẦN TÌM KIẾM */
 @media (max-width: 600px) {
+    .cysp-main-tabs { gap: 10px; }
+    .cysp-main-tab { font-size: 14px; padding: 10px 0; }
+
     .cysp-search-bar { gap: 6px; flex-direction: row; flex-wrap: nowrap; }
     #cysp-search-input { font-size: 14px; padding: 11px 10px; flex: 1 1 100%; min-width: 50px; margin: 0; }
     #cysp-search-btn { padding: 11px 14px; font-size: 13px; flex: 0 0 auto; width: auto !important; margin: 0; }
@@ -820,6 +884,163 @@ var cyspIsSeeking     = false;
 var cyspControlsTimer = null;
 
 // ==========================================
+// ĐỒNG BỘ DỮ LIỆU ĐÁM MÂY VS TRÌNH DUYỆT
+// ==========================================
+var cyspIsLoggedIn  = <?php echo is_user_logged_in() ? 'true' : 'false'; ?>;
+var cyspDbHistory   = {};
+var cyspDbFavorites = {};
+
+function cyspGetHistory() {
+    if (cyspIsLoggedIn) return cyspDbHistory;
+    try { return JSON.parse(localStorage.getItem('cysp_history') || '{}'); } catch(e) { return {}; }
+}
+
+function cyspGetFavorites() {
+    if (cyspIsLoggedIn) return cyspDbFavorites;
+    try { return JSON.parse(localStorage.getItem('cysp_favorites') || '{}'); } catch(e) { return {}; }
+}
+
+function cyspUpdateHistoryCount() {
+    var hist = cyspGetHistory();
+    jQuery('#cysp-history-count').text(Object.keys(hist).length);
+}
+
+function cyspUpdateFavCount() {
+    var favs = cyspGetFavorites();
+    jQuery('#cysp-fav-count').text(Object.keys(favs).length);
+}
+
+function cyspUpdateHistoryRecord(vid, title, thumb, channel, total, idx) {
+    var hist = cyspGetHistory();
+    var item = {
+        vid: vid,
+        title: title || (hist[vid] ? hist[vid].title : 'Bài tập'),
+        thumb: thumb || (hist[vid] ? hist[vid].thumb : ''),
+        channel: channel || (hist[vid] ? hist[vid].channel : ''),
+        total: total > 0 ? total : (hist[vid] ? hist[vid].total : 1),
+        lastIdx: hist[vid] ? Math.max(hist[vid].lastIdx, idx) : idx,
+        lastDate: Date.now()
+    };
+    hist[vid] = item;
+
+    if (cyspIsLoggedIn) {
+        cyspDbHistory = hist;
+        jQuery.post('<?php echo admin_url("admin-ajax.php"); ?>', {
+            action: 'cysp_sync_user_data', security: '<?php echo wp_create_nonce("cysp_search_secure_nonce"); ?>',
+            sync_action: 'update_history', vid: vid, data: JSON.stringify(item)
+        });
+    } else {
+        localStorage.setItem('cysp_history', JSON.stringify(hist));
+    }
+    
+    cyspUpdateHistoryCount();
+    if (jQuery('.cysp-main-tab[data-tab="history"]').hasClass('active')) cyspRenderHistoryTab();
+}
+
+function cyspToggleFavorite(vid, title, thumb, ch) {
+    var favs = cyspGetFavorites();
+    var isAdd = false;
+    var itemData = null;
+
+    if (favs[vid]) {
+        delete favs[vid];
+    } else {
+        isAdd = true;
+        itemData = { vid: vid, title: title, thumb: thumb, channel: ch, addedAt: Date.now() };
+        favs[vid] = itemData;
+    }
+
+    if (cyspIsLoggedIn) {
+        cyspDbFavorites = favs;
+        jQuery.post('<?php echo admin_url("admin-ajax.php"); ?>', {
+            action: 'cysp_sync_user_data', security: '<?php echo wp_create_nonce("cysp_search_secure_nonce"); ?>',
+            sync_action: 'toggle_favorite', vid: vid, is_add: isAdd, data: JSON.stringify(itemData)
+        });
+    } else {
+        localStorage.setItem('cysp_favorites', JSON.stringify(favs));
+    }
+
+    cyspUpdateFavCount();
+    return isAdd;
+}
+
+function cyspCheckIsFav(vid) {
+    return !!cyspGetFavorites()[vid];
+}
+
+// Sinh ra HTML cho nút Yêu thích (Trái tim)
+function cyspGetFavBtnHtml(vid, title, thumb, ch) {
+    var isFav = cyspCheckIsFav(vid);
+    var cls = isFav ? 'cysp-fav-btn active' : 'cysp-fav-btn';
+    var fillStyle = isFav ? 'display:block;' : 'display:none;';
+    var outStyle = isFav ? 'display:none;' : 'display:block;';
+    
+    return '<button class="'+cls+'" data-vid="'+vid+'" data-title="'+escAttr(title)+'" data-thumb="'+escAttr(thumb)+'" data-channel="'+escAttr(ch)+'" aria-label="Yêu thích">' +
+        '<svg class="icon-heart-out" style="'+outStyle+'" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>' +
+        '<svg class="icon-heart-in" style="'+fillStyle+'" viewBox="0 0 24 24" fill="#e91e63" stroke="#e91e63" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"></path></svg>' +
+        '</button>';
+}
+
+function cyspFmtDate(ms) {
+    var d = new Date(ms);
+    return d.getDate().toString().padStart(2, '0') + '/' + (d.getMonth() + 1).toString().padStart(2, '0') + '/' + d.getFullYear();
+}
+
+function cyspRenderHistoryTab() {
+    try {
+        var hist = cyspGetHistory();
+        var arr = Object.values(hist).sort(function(a, b) { return b.lastDate - a.lastDate; });
+        cyspUpdateHistoryCount();
+
+        var html = '';
+        if (arr.length === 0) {
+            html = '<p style="grid-column: 1/-1; color:#999;text-align:center;padding:28px 0;font-size:14px;">Bạn chưa có lịch sử học tập nào.</p>';
+        } else {
+            for (var i = 0; i < arr.length; i++) {
+                var item = arr[i];
+                var pct = item.total > 0 ? Math.min(100, Math.round(((item.lastIdx + 1) / item.total) * 100)) : 0;
+                var dt = cyspFmtDate(item.lastDate);
+                var favBtn = cyspGetFavBtnHtml(item.vid, item.title, item.thumb, item.channel);
+                
+                html += '<div class="cysp-item cysp-history-item" data-vid="'+item.vid+'" data-title="'+escAttr(item.title)+'" data-thumb="'+escAttr(item.thumb)+'" data-channel="'+escAttr(item.channel)+'" tabindex="0" role="button">';
+                html += '<div class="cysp-thumb-wrap"><img src="'+escAttr(item.thumb)+'" loading="lazy">'+favBtn+'<span class="cysp-cc-badge cysp-cc-badge--local">Đã học</span></div>';
+                html += '<div class="cysp-card-info">';
+                html += '<h4 class="cysp-card-title">'+esc(item.title)+'</h4>';
+                html += '<p class="cysp-card-channel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>'+esc(item.channel)+'</p>';
+                html += '<div class="cysp-history-progress"><div class="cysp-hp-bar"><div class="cysp-hp-fill" style="width:'+pct+'%"></div></div>';
+                html += '<div class="cysp-hp-meta"><span>Đã học: '+(item.lastIdx + 1)+'/'+item.total+' câu</span><span>'+dt+'</span></div>';
+                html += '</div></div></div>';
+            }
+        }
+        jQuery('#cysp-history-grid').html(html);
+    } catch(e){}
+}
+
+function cyspRenderFavoritesTab() {
+    var favs = cyspGetFavorites();
+    var arr = Object.values(favs).sort(function(a, b) { return b.addedAt - a.addedAt; });
+    cyspUpdateFavCount();
+
+    var html = '';
+    if (arr.length === 0) {
+        html = '<p style="grid-column: 1/-1; color:#999;text-align:center;padding:28px 0;font-size:14px;">Bạn chưa có video yêu thích nào.</p>';
+    } else {
+        for (var i = 0; i < arr.length; i++) {
+            var item = arr[i];
+            var favBtn = cyspGetFavBtnHtml(item.vid, item.title, item.thumb, item.channel);
+
+            html += '<div class="cysp-item" data-vid="'+item.vid+'" data-title="'+escAttr(item.title)+'" data-thumb="'+escAttr(item.thumb)+'" data-channel="'+escAttr(item.channel)+'" tabindex="0" role="button">';
+            html += '<div class="cysp-thumb-wrap"><img src="'+escAttr(item.thumb)+'" loading="lazy"><div class="cysp-thumb-overlay" aria-hidden="true"><div class="cysp-thumb-overlay-icon"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div></div>'+favBtn+'</div>';
+            html += '<div class="cysp-card-info">';
+            html += '<h4 class="cysp-card-title">'+esc(item.title)+'</h4>';
+            html += '<p class="cysp-card-channel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>'+esc(item.channel)+'</p>';
+            html += '</div></div>';
+        }
+    }
+    jQuery('#cysp-favorites-grid').html(html);
+}
+
+// ==========================================
 // SESSION RESTORE HELPERS
 // ==========================================
 var CYSP_SS_VID  = 'cysp_vid';
@@ -834,9 +1055,7 @@ function cyspSaveSession() {
         sessionStorage.setItem(CYSP_SS_LP,   cyspCurrentLp);
         sessionStorage.setItem(CYSP_SS_MODE, cyspCurrentMode);
         sessionStorage.setItem(CYSP_SS_IDX,  cyspSentenceIndex || 0);
-        if (cyspPlayer) {
-            try { sessionStorage.setItem(CYSP_SS_TIME, cyspPlayer.getCurrentTime() || 0); } catch(e) {}
-        }
+        if (cyspPlayer) { try { sessionStorage.setItem(CYSP_SS_TIME, cyspPlayer.getCurrentTime() || 0); } catch(e) {} }
     } catch(e) {}
 }
 
@@ -862,60 +1081,6 @@ function cyspGetSession() {
             time: parseFloat(sessionStorage.getItem(CYSP_SS_TIME) || '0'),
         };
     } catch(e) { return null; }
-}
-
-// ==========================================
-// LỊCH SỬ ĐÃ HỌC (LOCAL STORAGE)
-// ==========================================
-function cyspUpdateHistoryRecord(vid, title, thumb, channel, total, idx) {
-    try {
-        var hist = JSON.parse(localStorage.getItem('cysp_history') || '{}');
-        hist[vid] = {
-            vid: vid,
-            title: title || (hist[vid] ? hist[vid].title : 'Bài tập'),
-            thumb: thumb || (hist[vid] ? hist[vid].thumb : ''),
-            channel: channel || (hist[vid] ? hist[vid].channel : ''),
-            total: total > 0 ? total : (hist[vid] ? hist[vid].total : 1),
-            lastIdx: hist[vid] ? Math.max(hist[vid].lastIdx, idx) : idx,
-            lastDate: Date.now()
-        };
-        localStorage.setItem('cysp_history', JSON.stringify(hist));
-        cyspRenderHistoryTab();
-    } catch(e){}
-}
-
-function cyspFmtDate(ms) {
-    var d = new Date(ms);
-    return d.getDate().toString().padStart(2, '0') + '/' + (d.getMonth() + 1).toString().padStart(2, '0') + '/' + d.getFullYear();
-}
-
-function cyspRenderHistoryTab() {
-    try {
-        var hist = JSON.parse(localStorage.getItem('cysp_history') || '{}');
-        var arr = Object.values(hist).sort(function(a, b) { return b.lastDate - a.lastDate; });
-        if (arr.length > 0) {
-            jQuery('#cysp-main-tabs').show();
-            jQuery('#cysp-history-count').text(arr.length);
-        } else {
-            jQuery('#cysp-main-tabs').hide();
-        }
-
-        var html = '';
-        for (var i = 0; i < arr.length; i++) {
-            var item = arr[i];
-            var pct = item.total > 0 ? Math.min(100, Math.round(((item.lastIdx + 1) / item.total) * 100)) : 0;
-            var dt = cyspFmtDate(item.lastDate);
-            html += '<div class="cysp-item cysp-history-item" data-vid="'+item.vid+'" data-title="'+escAttr(item.title)+'" data-thumb="'+escAttr(item.thumb)+'" data-channel="'+escAttr(item.channel)+'">';
-            html += '<div class="cysp-thumb-wrap"><img src="'+escAttr(item.thumb)+'" loading="lazy"><span class="cysp-cc-badge cysp-cc-badge--local">Đã học</span></div>';
-            html += '<div class="cysp-card-info">';
-            html += '<h4 class="cysp-card-title">'+esc(item.title)+'</h4>';
-            html += '<p class="cysp-card-channel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>'+esc(item.channel)+'</p>';
-            html += '<div class="cysp-history-progress"><div class="cysp-hp-bar"><div class="cysp-hp-fill" style="width:'+pct+'%"></div></div>';
-            html += '<div class="cysp-hp-meta"><span>Đã học: '+(item.lastIdx + 1)+'/'+item.total+' câu</span><span>'+dt+'</span></div>';
-            html += '</div></div></div>';
-        }
-        jQuery('#cysp-history-grid').html(html);
-    } catch(e){}
 }
 
 function onYouTubeIframeAPIReady() { }
@@ -1019,19 +1184,83 @@ function escAttr(s) { return esc(s).replace(/"/g,'&quot;'); }
 
 jQuery(document).ready(function($) {
 
-    cyspRenderHistoryTab(); // Load history ngay từ đầu
+    // Khởi tạo ứng dụng sau khi đồng bộ dữ liệu DB (nếu đã login)
+    function cyspInitApp() {
+        cyspUpdateHistoryCount(); 
+        cyspUpdateFavCount();
+        loadLocalLibrary();
+        cyspRestoreSessionLogic();
+    }
 
-    /* Tabs (Tìm kiếm & Đã học) */
+    if (cyspIsLoggedIn) {
+        $.post('<?php echo admin_url("admin-ajax.php"); ?>', {
+            action: 'cysp_sync_user_data',
+            security: '<?php echo wp_create_nonce("cysp_search_secure_nonce"); ?>',
+            sync_action: 'get'
+        }, function(res) {
+            if (res.success) {
+                cyspDbHistory = res.data.history || {};
+                cyspDbFavorites = res.data.favorites || {};
+            }
+            cyspInitApp();
+        });
+    } else {
+        cyspInitApp();
+    }
+
+    /* Tabs (Khám phá / Đã học / Yêu thích) */
     $('.cysp-main-tab').click(function() {
         $('.cysp-main-tab').removeClass('active');
         $(this).addClass('active');
-        if ($(this).data('tab') === 'search') {
+        
+        var tab = $(this).data('tab');
+        $('#cysp-tab-search-content, #cysp-tab-history-content, #cysp-tab-favorites-content').hide();
+
+        if (tab === 'search') {
             $('#cysp-tab-search-content').show();
-            $('#cysp-tab-history-content').hide();
-        } else {
-            $('#cysp-tab-search-content').hide();
+        } else if (tab === 'history') {
             $('#cysp-tab-history-content').show();
-            cyspRenderHistoryTab(); // Cập nhật lại list mỗi khi chuyển qua
+            cyspRenderHistoryTab();
+        } else if (tab === 'favorites') {
+            $('#cysp-tab-favorites-content').show();
+            cyspRenderFavoritesTab();
+        }
+    });
+
+    /* Nút Yêu thích (Tim) */
+    $(document).on('click', '.cysp-fav-btn', function(e) {
+        e.preventDefault();
+        e.stopPropagation(); // Ngăn chặn sự kiện click lan ra mở Video
+
+        var vid = $(this).data('vid');
+        var title = $(this).data('title');
+        var thumb = $(this).data('thumb');
+        var ch = $(this).data('channel');
+        
+        // Thêm / Xóa vào bộ nhớ
+        var isNowFav = cyspToggleFavorite(vid, title, thumb, ch);
+
+        // Đồng bộ toàn bộ Icon của Video này trên màn hình
+        $('.cysp-fav-btn[data-vid="'+vid+'"]').each(function() {
+            if (isNowFav) {
+                $(this).addClass('active').find('.icon-heart-out').hide();
+                $(this).find('.icon-heart-in').show();
+            } else {
+                $(this).removeClass('active').find('.icon-heart-in').hide();
+                $(this).find('.icon-heart-out').show();
+            }
+        });
+
+        // Nếu đang đứng ở Tab Yêu thích mà Bỏ thích -> Làm mờ và ẩn đi
+        if ($('.cysp-main-tab[data-tab="favorites"]').hasClass('active')) {
+            if (!isNowFav) {
+                $(this).closest('.cysp-item').fadeOut(300, function() {
+                    $(this).remove();
+                    if (Object.keys(cyspGetFavorites()).length === 0) {
+                        $('#cysp-favorites-grid').html('<p style="grid-column: 1/-1; color:#999;text-align:center;padding:28px 0;font-size:14px;">Bạn chưa có video yêu thích nào.</p>');
+                    }
+                });
+            }
         }
     });
 
@@ -1072,7 +1301,7 @@ jQuery(document).ready(function($) {
     $('#cysp-fs-btn').click(function() { var el = document.getElementById('cysp-custom-player'); if (!document.fullscreenElement) { (el.requestFullscreen || el.webkitRequestFullscreen || el.mozRequestFullScreen).call(el); } else { (document.exitFullscreen || document.webkitExitFullscreen || document.mozCancelFullScreen).call(document); } });
     $('.cysp-speed-pill').click(function() { $('.cysp-speed-pill').removeClass('cysp-speed-pill--active').attr('aria-pressed', 'false'); $(this).addClass('cysp-speed-pill--active').attr('aria-pressed', 'true'); var rate = parseFloat($(this).data('rate')); if (cyspPlayer) cyspPlayer.setPlaybackRate(rate); $('.cysp-speed-opt').removeClass('cysp-speed-opt--active'); $('.cysp-speed-opt[data-rate="' + rate + '"]').addClass('cysp-speed-opt--active'); $('#cysp-speed-label').text(rate + '×'); });
 
-    /* Item Card HTML */
+    /* Item Card HTML (Khám phá) */
     function buildItemHtml(item, hasLocal) {
         var vid   = item.id.videoId;
         var thumb = item.snippet.thumbnails.medium ? item.snippet.thumbnails.medium.url : (item.snippet.thumbnails.default ? item.snippet.thumbnails.default.url : '');
@@ -1082,12 +1311,13 @@ jQuery(document).ready(function($) {
         if (hasLocal) badge = '<span class="cysp-cc-badge cysp-cc-badge--local">Có bài tập</span>';
         else if ($('#cysp-caption').val() === 'closedCaption') badge = '<span class="cysp-cc-badge">CC</span>';
         
-        // Thêm data- attributes để sử dụng trong lưu lịch sử
+        var favBtn = cyspGetFavBtnHtml(vid, title, thumb, ch);
+        
         return '<div class="cysp-item" data-vid="' + vid + '" data-title="' + escAttr(title) + '" data-thumb="' + escAttr(thumb) + '" data-channel="' + escAttr(ch) + '" tabindex="0" role="button" aria-label="' + escAttr(title) + '">'
             + '<div class="cysp-thumb-wrap">'
             + '<img src="' + thumb + '" loading="lazy" alt="" />'
             + '<div class="cysp-thumb-overlay" aria-hidden="true"><div class="cysp-thumb-overlay-icon"><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></div></div>'
-            + badge + '</div>'
+            + badge + favBtn + '</div>'
             + '<div class="cysp-card-info">'
             + '<h4 class="cysp-card-title">' + esc(title) + '</h4>'
             + '<p class="cysp-card-channel"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>' + esc(ch) + '</p>'
@@ -1108,13 +1338,11 @@ jQuery(document).ready(function($) {
             }
         });
     }
-    loadLocalLibrary();
 
     function performSearch() {
         var query = $('#cysp-search-input').val().trim();
         cyspClearSession();
-        // Chuyển về tab Tìm Kiếm nếu đang ở Đã học
-        $('.cysp-main-tab[data-tab="search"]').click();
+        $('.cysp-main-tab[data-tab="search"]').click(); // Quay lại tab search
 
         if (!query) { loadLocalLibrary(); return; }
         $('#cysp-results').empty(); $('#cysp-loading').show();
@@ -1146,11 +1374,13 @@ jQuery(document).ready(function($) {
 
     /* Load Player & Video */
     $(document).on('click keypress', '.cysp-item', function(e) {
+        // Nếu click trúng thẻ tim (hoặc bên trong thẻ tim) thì bỏ qua, vì xử lý fav riêng
+        if ($(e.target).closest('.cysp-fav-btn').length > 0) return;
+
         if (e.type === 'keypress' && e.which !== 13) return;
         var vid = $(this).data('vid');
         var lp  = $('#cysp-lang').val() === 'zh-Hant' ? 'zh-TW' : 'zh-CN';
 
-        // Lấy Metadata từ card
         cyspCurrentMeta = {
             title: $(this).data('title'),
             thumb: $(this).data('thumb'),
@@ -1192,7 +1422,6 @@ jQuery(document).ready(function($) {
             $('#cysp-mode-toolbar').fadeIn(200);
             cyspTranscript = res.data;
 
-            // Khởi tạo lịch sử khi load thành công transcript
             if (cyspCurrentMeta) {
                 cyspUpdateHistoryRecord(vid, cyspCurrentMeta.title, cyspCurrentMeta.thumb, cyspCurrentMeta.channel, cyspTranscript.length, 0);
             }
@@ -1218,7 +1447,6 @@ jQuery(document).ready(function($) {
         $('#shadow-playback-row').hide(); $('#shadow-clear-rec-btn').hide(); $('#shadow-idle-label').text('Nhấn Phát để bắt đầu');
 
         cyspSaveSession();
-        // Cập nhật record tiến độ
         cyspUpdateHistoryRecord(cyspCurrentVid, null, null, null, cyspTranscript.length, idx);
 
         if (cyspAutoPlay && cyspCurrentMode !== 'normal' && cyspPlayer) {
@@ -1351,8 +1579,8 @@ jQuery(document).ready(function($) {
 
     $('#cysp-restore-toast-close').click(function() { $('#cysp-restore-toast').removeClass('show'); });
 
-    /* Restore Session */
-    (function restoreSession() {
+    /* Restore Session Logic */
+    function cyspRestoreSessionLogic() {
         var ss = cyspGetSession();
         if (!ss || !ss.vid) return;
         $('#cysp-restore-toast-msg').text('⏮ Đang khôi phục bài học trước...'); $('#cysp-restore-toast').addClass('show');
@@ -1379,7 +1607,7 @@ jQuery(document).ready(function($) {
             });
         }, 300);
         setTimeout(function() { clearInterval(ytWait); $('#cysp-restore-toast').removeClass('show'); }, 12000);
-    })();
+    }
 });
 </script>
 
