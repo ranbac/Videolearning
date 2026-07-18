@@ -15,8 +15,8 @@ function cysp_add_settings_page() {
 function cysp_render_settings_page() {
     // ---- XỬ LÝ NÚT "XÓA SỐ ĐẾM HÔM NAY" ----
     if (isset($_POST['cysp_reset_daily_counts']) && check_admin_referer('cysp_reset_daily_counts_action', 'cysp_reset_nonce')) {
-        $deleted_count = cysp_reset_all_daily_counts();
-        echo '<div class="notice notice-success is-dismissible"><p>Đã xóa số đếm hôm nay cho <strong>' . (int) $deleted_count . '</strong> người dùng. Tất cả user Free có thể học lại từ đầu.</p></div>';
+        $result = cysp_reset_all_daily_counts();
+        echo '<div class="notice notice-success is-dismissible"><p>Đã quét <strong>' . (int) $result['total_users'] . '</strong> tài khoản, xóa số đếm cho <strong>' . (int) $result['deleted'] . '</strong> người từng có lượt học hôm nay. Tất cả user Free có thể học lại từ đầu ngay bây giờ.</p></div>';
     }
     ?>
     <div class="wrap">
@@ -37,10 +37,34 @@ function cysp_render_settings_page() {
                     <td><input type="text" name="cysp_azure_region" value="<?php echo esc_attr(get_option('cysp_azure_region')); ?>" style="width:200px;" placeholder="Ví dụ: southeastasia" /></td>
                 </tr>
                 <tr valign="top">
-                    <th scope="row" style="padding-top:20px;"><strong>PMPro Premium Level IDs:</strong></th>
+                    <th scope="row" style="padding-top:20px;"><strong>Level Premium:</strong></th>
                     <td style="padding-top:20px;">
-                        <input type="text" name="cysp_premium_level_ids" value="<?php echo esc_attr(get_option('cysp_premium_level_ids', '1')); ?>" style="width:200px;" placeholder="Ví dụ: 1,2" />
-                        <p class="description">Danh sách ID cấp độ Premium trong PMPro (Memberships → Levels), cách nhau bởi dấu phẩy.</p>
+                        <?php
+                        $selected_ids = get_option('cysp_premium_level_ids', []);
+                        if (!is_array($selected_ids)) {
+                            // Hỗ trợ ngược dữ liệu cũ dạng chuỗi "1,2" nếu còn tồn tại
+                            $selected_ids = array_filter(array_map('trim', explode(',', (string) $selected_ids)));
+                        }
+                        $selected_ids = array_map('intval', $selected_ids);
+
+                        if (function_exists('pmpro_getAllLevels')) {
+                            $all_levels = pmpro_getAllLevels(true, true); // gồm cả level ẩn/không public
+                            if (!empty($all_levels)) {
+                                foreach ($all_levels as $level) {
+                                    $checked = in_array((int) $level->id, $selected_ids, true) ? 'checked' : '';
+                                    echo '<label style="display:block;margin-bottom:6px;">';
+                                    echo '<input type="checkbox" name="cysp_premium_level_ids[]" value="' . (int) $level->id . '" ' . $checked . ' /> ';
+                                    echo esc_html($level->name) . ' (ID: ' . (int) $level->id . ')';
+                                    echo '</label>';
+                                }
+                            } else {
+                                echo '<p class="description">Chưa có cấp độ (Level) nào trong PMPro. Vào Memberships → Levels để tạo.</p>';
+                            }
+                        } else {
+                            echo '<p class="description" style="color:#c62828;">Plugin Paid Memberships Pro chưa được kích hoạt.</p>';
+                        }
+                        ?>
+                        <p class="description">Tick chọn các cấp độ được coi là <strong>Premium</strong> (không giới hạn video/ngày). Cấp độ không tick sẽ bị tính là Free.</p>
                     </td>
                 </tr>
                 <tr valign="top">
@@ -66,27 +90,54 @@ function cysp_render_settings_page() {
 }
 
 // Xóa toàn bộ transient đếm video/ngày của mọi user (dùng cho nút Reset trên dashboard)
+// Duyệt qua TOÀN BỘ user_id thật trên site và gọi delete_transient() trực tiếp cho từng người —
+// cách này đúng bất kể transient đang nằm trong bảng wp_options hay trong object cache
+// persistent (Redis/Memcached), vì delete_transient() tự biết xóa đúng chỗ mà không cần
+// biết trước bản ghi có tồn tại hay không. Dò theo DB (LIKE '_transient_...') sẽ luôn ra 0
+// nếu site dùng object cache persistent, vì lúc đó set_transient() không hề ghi vào DB.
 function cysp_reset_all_daily_counts() {
+    $today = current_time('Y-m-d');
+    $count = 0;
+
+    $user_ids = get_users(['fields' => 'ID']);
+    foreach ($user_ids as $user_id) {
+        $key = 'cysp_daily_videos_' . $user_id . '_' . $today;
+        if (delete_transient($key)) {
+            $count++;
+        }
+    }
+
+    // Dọn thêm rác trong DB phòng trường hợp site KHÔNG dùng object cache
+    // (một số hosting để lại bản ghi mồ côi nếu transient hết hạn giữa chừng)
     global $wpdb;
     $like = $wpdb->esc_like('_transient_cysp_daily_videos_') . '%';
     $timeout_like = $wpdb->esc_like('_transient_timeout_cysp_daily_videos_') . '%';
+    $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $like));
+    $wpdb->query($wpdb->prepare("DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $timeout_like));
 
-    $count = $wpdb->query(
-        $wpdb->prepare("DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $like)
-    );
-    $wpdb->query(
-        $wpdb->prepare("DELETE FROM {$wpdb->options} WHERE option_name LIKE %s", $timeout_like)
-    );
+    // Nếu site dùng object cache toàn cục (Redis/Memcached qua drop-in), flush luôn để chắc chắn
+    if (function_exists('wp_cache_flush')) {
+        wp_cache_flush();
+    }
 
-    return (int) $count;
+    return ['total_users' => count($user_ids), 'deleted' => $count];
 }
 add_action('admin_init', 'cysp_register_settings');
 function cysp_register_settings() {
     register_setting('cysp_settings_group', 'cysp_api_key');
     register_setting('cysp_settings_group', 'cysp_azure_key');
     register_setting('cysp_settings_group', 'cysp_azure_region');
-    register_setting('cysp_settings_group', 'cysp_premium_level_ids');
+    register_setting('cysp_settings_group', 'cysp_premium_level_ids', [
+        'sanitize_callback' => 'cysp_sanitize_premium_level_ids',
+        'default'           => [],
+    ]);
     register_setting('cysp_settings_group', 'cysp_free_daily_limit');
+}
+
+// Chuẩn hóa dữ liệu checkbox gửi lên: mảng các ID số nguyên, rỗng nếu không tick gì
+function cysp_sanitize_premium_level_ids($input) {
+    if (!is_array($input)) return [];
+    return array_values(array_unique(array_map('intval', $input)));
 }
 
 // ==========================================
@@ -159,10 +210,18 @@ function cysp_get_all_local_videos_metadata($api_key, $transcript_dir) {
 // ==========================================
 function cysp_user_is_premium($user_id) {
     if (!$user_id) return false;
+
+    // Admin luôn được coi là Premium, bỏ qua mọi giới hạn video/ngày
+    if (user_can($user_id, 'manage_options')) return true;
+
     if (function_exists('pmpro_hasMembershipLevel')) {
-        $level_ids_raw = get_option('cysp_premium_level_ids', '1');
-        $level_ids     = array_map('trim', explode(',', $level_ids_raw));
-        $level_ids     = array_map('intval', $level_ids);
+        $level_ids = get_option('cysp_premium_level_ids', []);
+        if (!is_array($level_ids)) {
+            // Hỗ trợ ngược dữ liệu cũ dạng chuỗi "1,2" nếu còn tồn tại
+            $level_ids = array_filter(array_map('trim', explode(',', (string) $level_ids)));
+        }
+        $level_ids = array_map('intval', $level_ids);
+        if (empty($level_ids)) return false;
         return pmpro_hasMembershipLevel($level_ids, $user_id);
     }
     return false;
@@ -510,6 +569,7 @@ function cysp_shortcode_html() {
                 <span class="cysp-tag cysp-tag--topic" data-channel-id="UCyYT-HdG1FXua6_vwyXNqhg" data-channel-name="Chinese Daily Podcast">🎙️ Chinese Daily Podcast</span>
                 <span class="cysp-tag cysp-tag--topic" data-channel-id="UCcvTOgUiplI80SPR73ogCEQ" data-channel-name="Mandarin Click">🖱️ Mandarin Click</span>
                 <span class="cysp-tag cysp-tag--topic" data-channel-id="UCPa94XCYIZlPvDXJk-MDaYA" data-channel-name="Learn Chinese Essentials">📚 Learn Chinese Essentials</span>
+                <span class="cysp-tag cysp-tag--topic" data-channel-id="UC2fAiRQHRQT9aj9P_ijYeow" data-channel-name="Mandarin Corner">🗣️ Mandarin Corner</span>
                 <span class="cysp-tag cysp-tag--topic" data-channel-id="UCRY8eBLd9tPFw5-JY7S7O8Q" data-channel-name="ChinesePod">🎧 ChinesePod</span>
             </div>
 
